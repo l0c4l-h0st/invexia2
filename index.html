@@ -40,7 +40,7 @@
         <div><kbd>C</kbd><span>Glisser / s’accroupir</span></div>
         <div><kbd>V</kbd><span>Plonger en sprint</span></div>
         <div><kbd>Espace</kbd><span>Sauter · maintenir pour enchaîner</span></div>
-        <div><kbd>F</kbd><span>Inspecter le karambit</span></div>
+        <div><kbd>F</kbd><span>Inspecter · 4 figures en boucle, un appui prépare la suivante</span></div>
         <div><kbd>Ctrl</kbd><span>Freiner / marcher</span></div>
         <div><kbd>R</kbd><span>Revenir au départ</span></div>
       </div>
@@ -4790,15 +4790,17 @@ var KarambitVM = (() => {
       return a;
     }
     const solveFingerChain = (hand, a, f, from, to, obs, tol) => solveChain(hand, a, [f * 4 + 1, f * 4 + 2, f * 4 + 3], [0, 1, 2], [f * 3, f * 3 + 1, f * 3 + 2], from.slice(1), to.slice(1), obs, tol);
+    // Account for the mesh between sampled vertices when fitting the grip.
+    const gripClearance = 0.00018;
     function solveGrip(g = GRIP) {
       const a = poseArray(POSES.open);
       for (let j = 0; j < 4; j++) a[j] = g.index[j];
       applyAngles(right, a);
       const km = knifeHandMatrix(right, g.theta * DEG, g.slide * MM, g.ecc, g.eccAng * DEG, knifeInHand.clone());
-      solveFingerChain(right, a, 0, g.index, [g.index[0], g.index[1], CLOSE[2], CLOSE[3]], { km, palm: !0 });
-      for (let f = 1; f < 4; f++) { a[f * 4] = [0, 1, 4, 8][f]; solveFingerChain(right, a, f, OPEN, CLOSE, { km, palm: !0 }); }
+      solveFingerChain(right, a, 0, g.index, [g.index[0], g.index[1], CLOSE[2], CLOSE[3]], { km, palm: !0 }, -gripClearance);
+      for (let f = 1; f < 4; f++) { a[f * 4] = [0, 1, 4, 8][f]; solveFingerChain(right, a, f, OPEN, CLOSE, { km, palm: !0 }, -gripClearance); }
       handCapsules(right, caps);
-      solveChain(right, a, [16, 17, 18, 19, 20], [0, 0, 0, 1, 2], [12, 13, 14], T_OPEN, T_CLOSE, { km, palm: !1, caps: [0, 1, 2, 3, 4, 5] }, 0.0008);
+      solveChain(right, a, [16, 17, 18, 19, 20], [0, 0, 0, 1, 2], [12, 13, 14], T_OPEN, T_CLOSE, { km, palm: !1, caps: [0, 1, 2, 3, 4, 5] }, -gripClearance);
       applyAngles(right, a);
       gripPose = { a, km };
       return gripPose;
@@ -5040,7 +5042,7 @@ var KarambitVM = (() => {
         { t: 2.35, hand: FACE_A },
         { t: 2.55, fingers: thumbLift(7) },                                            // thumb shifts on the handle
         { t: 2.85, fingers: "grip" },
-        { t: 3.1, hand: FACE_A2 },
+        { t: 2.72, hand: FACE_A2 },
         { t: 3.42, hand: twist(SPIN_HAND, -12, [0.004, -0.006, 0.004]) },            // wrist cocks before the flick
         ...release(3.55, SPIN_HAND, HS.hang),
         { t: 3.8, kick: flick(SPIN_HAND, 2.6) },
@@ -5050,6 +5052,36 @@ var KarambitVM = (() => {
         ...regrip(s1.end, HS.hang - 360, G - 360),
         { t: s1.end + 0.33, left: 1 },
         { t: s1.end + 0.84, hand: "idle", fingers: "grip", theta: G - 360, left: 0 },
+      ] },
+      // A slow profile held by the ring. The grip opens before the arc starts.
+      inspectMedallion: { dur: 4.55, kind: "inspect", keys: [
+        { t: 0, hand: "idle", fingers: "grip", theta: G, slide: 31, ecc: ECC, left: 0 },
+        { t: 0.30, left: 0.9 },
+        ...release(0.48, FID_HAND, HF.hang),
+        { t: 0.82, theta: HF.hang, slide: 38, fingers: SEMI, sfx: ["scrape", 0.35] },
+        { t: 1.13, hand: twist(FID_HAND, -17, [0.012, 0.044, -0.028]), theta: HF.hang - 10 },
+        { t: 1.70, hand: twist(FID_HAND, -11, [0.006, 0.049, -0.03]), theta: HF.hang + 3 },
+        { t: 2.65, hand: twist(FID_HAND, 13, [-0.012, 0.037, -0.038]), theta: HF.hang - 3 },
+        { t: 3.48, hand: twist(FID_HAND, 7, [-0.005, 0.032, -0.03]), theta: HF.hang },
+        { t: 3.71, hand: FID_HAND, theta: HF.hang, slide: 38 },
+        ...regrip(3.74, HF.hang, G, FID_HAND),
+        { t: 4.12, theta: G, fingers: "grip", left: 0.75 },
+        { t: 4.55, hand: "idle", fingers: "grip", theta: G, left: 0 },
+      ] },
+      // A sideways figure eight drawn with the entire hand, while the grip
+      // and the ring stay locked together through both crossings.
+      inspectRibbon: { dur: 2.72, kind: "inspect", keys: [
+        { t: 0, hand: "idle", fingers: "grip", theta: G, slide: 31, ecc: ECC, left: 0 },
+        { t: 0.32, hand: twist(FACE_B, -9, [0.022, 0.016, -0.05]), left: 0.85 },
+        { t: 0.59, hand: twist(FACE_B, -25, [-0.020, 0.047, -0.053]) },
+        { t: 0.88, hand: twist(FACE_B, -37, [-0.073, 0.026, -0.062]) },
+        { t: 1.10, hand: twist(FACE_B, -11, [-0.054, -0.014, -0.059]) },
+        { t: 1.31, hand: twist(FACE_B, 4, [-0.010, 0.009, -0.054]) },
+        { t: 1.57, hand: twist(FACE_B, 26, [0.037, 0.044, -0.054]) },
+        { t: 1.84, hand: twist(FACE_B, 33, [0.070, 0.015, -0.064]) },
+        { t: 2.07, hand: twist(FACE_B, 12, [0.050, -0.017, -0.058]) },
+        { t: 2.35, hand: twist(FACE_B, -6, [0.010, 0.010, -0.037]), left: 0.72 },
+        { t: 2.72, hand: "idle", fingers: "grip", theta: G, left: 0 },
       ] },
       // rare inspection: spin, toss (free flight, one turn around the centre of mass), ring caught on the index
       inspectRare: { dur: r2.end + 0.86, kind: "inspect", toss: { t0: T0, t1: T1, turns: 1.5 }, keys: [
@@ -5110,27 +5142,36 @@ var KarambitVM = (() => {
     for (const [n, s] of Object.entries(SPECS)) compile(n, s);
 
     /* ---------- runtime state ---------- */
-    const st = { clip: CLIPS.equip, time: 0, queue: 0, still: 0, fidgetIn: 3, rareStreak: 0, lastRare: !1, frozen: !1 };
+    const st = { clip: CLIPS.equip, time: 0, queue: 0, still: 0, fidgetIn: 3, nextInspect: 0, frozen: !1 };
     const dbgCam = new Ue(30, 1, 0.005, 5); let view = null, held = !1;
 
+    const inspectionOrder = [CLIPS.inspect, CLIPS.inspectMedallion, CLIPS.inspectRibbon, CLIPS.inspectRare];
     function pickInspect() {
-      const rare = CLIPS.inspectRare && !st.lastRare && (st.rareStreak >= 4 || Math.random() < 0.22);
-      st.lastRare = !!rare; st.rareStreak = rare ? 0 : st.rareStreak + 1;
-      return rare ? CLIPS.inspectRare : CLIPS.inspect || CLIPS.idle;
+      const clip = inspectionOrder[st.nextInspect];
+      st.nextInspect = (st.nextInspect + 1) % inspectionOrder.length;
+      return clip;
     }
     function advance(dt, still) {
       if (st.frozen) return;
-      const c0 = st.clip, t0 = st.time;
-      st.time += dt;
-      if (c0) for (const e of c0.events) if (e.t > t0 && e.t <= st.time) { if (e.sfx) playSfx(e.sfx, e.k); else kick(right, e.v, e.w); }
-      if (st.clip && st.time >= st.clip.dur) {
-        if (st.queue > 0) { st.queue--; st.clip = pickInspect(); st.time = 0; }
-        else { st.clip = null; st.time = 0; }
-      }
-      if (!st.clip) {
-        if (st.queue > 0) { st.queue--; st.clip = pickInspect(); st.time = 0; return; }
-        st.still = still ? st.still + dt : 0;
-        if (still && st.still > st.fidgetIn && CLIPS.fidget) { st.clip = Math.random() < 0.5 ? CLIPS.fidget : CLIPS.fidget2 || CLIPS.fidget; st.time = 0; st.still = 0; st.fidgetIn = 3.5 + Math.random() * 3; }
+      while (dt > 0) {
+        if (!st.clip) {
+          if (st.queue) { st.queue = 0; st.clip = pickInspect(); }
+          else {
+            st.still = still ? st.still + dt : 0;
+            if (!still || st.still < st.fidgetIn) return;
+            dt = st.still - st.fidgetIn;
+            st.clip = Math.random() < 0.5 ? CLIPS.fidget : CLIPS.fidget2;
+            st.still = 0; st.fidgetIn = 3.5 + Math.random() * 3;
+          }
+        }
+        const clip = st.clip, old = st.time, slice = Math.min(dt, clip.dur - old);
+        st.time = Math.min(clip.dur, old + slice);
+        for (const e of clip.events) if (e.t > old && e.t <= st.time) {
+          if (e.sfx) playSfx(e.sfx, e.k); else kick(right, e.v, e.w);
+        }
+        dt -= slice;
+        if (st.time < clip.dur) return;
+        st.time = 0; st.clip = st.queue ? pickInspect() : null; st.queue = 0;
       }
     }
     function evalClip(clip, t) {
@@ -5157,8 +5198,10 @@ var KarambitVM = (() => {
       // forearm direction: towards the shoulder anchor, bent at the wrist only within anatomical limits
       fdir.subVectors(anchor, pos).normalize();
       const inv = tmpQ.copy(q).invert(); fdir.applyQuaternion(inv);
-      let flex = Math.atan2(fdir.y, Math.max(1e-4, fdir.z)), dev = Math.atan2(fdir.x * hand.side, Math.max(1e-4, fdir.z));
-      if (fdir.z < 0.05) { flex = Math.sign(fdir.y || 1) * 89 * DEG; }
+      // The shoulder can pass behind the hand during a roll. Keep its projection
+      // continuous as it crosses the wrist plane, including directly behind it.
+      const forward = Math.max(0.30, fdir.z);
+      let flex = Math.atan2(fdir.y, forward), dev = Math.atan2(fdir.x * hand.side, forward);
       flex = clamp(flex, WRIST.flex[0] * DEG, WRIST.flex[1] * DEG); dev = clamp(dev, WRIST.dev[0] * DEG, WRIST.dev[1] * DEG);
       fdir.set(Math.tan(dev) * hand.side, Math.tan(flex), 1).normalize().applyQuaternion(q);
       hz.set(0, 0, 1).applyQuaternion(q);
@@ -5274,7 +5317,7 @@ var KarambitVM = (() => {
         turnY += ((P.pitch - pitch0) * inv - turnY) * kk;
         accF += (clamp((vF - vF0) * inv, -60, 60) - accF) * kk; accR += (clamp((vR - vR0) * inv, -60, 60) - accR) * kk;
         // impulses: take-off, landing, footsteps, slide and dive starts
-        const m = motion;
+        const m = motion * (clip.kind === "inspect" ? 1 - 0.72 * busy : 1);
         if (wasGrounded && !P.grounded && P.vy > 1) for (const h of hands) kick(h, _v1.set(0, -0.3 * m, 0.05 * m), _v2.set(0.6 * m, 0, 0));
         if (fx.landing > 0) for (const h of hands) kick(h, _v1.set(0, -0.85 * fx.landing * m, -0.08 * fx.landing * m), _v2.set(-1.4 * fx.landing * m, 0, 0));
         if (fx.footfall > 0) for (const h of hands) kick(h, _v1.set(0, -(0.05 + 0.07 * Wt.sprint + 0.09 * Wt.tac) * fx.footfall * m, 0), null);
@@ -5286,7 +5329,7 @@ var KarambitVM = (() => {
 
       // right hand: clip pose + movement offset (softened while inspecting, never cancelled)
       moveTarget(right, fx, motion, nt, busy, mp, mq);
-      const wl = 1 - 0.55 * busy;
+      const wl = 1 - (clip.kind === "inspect" ? 0.88 : 0.55) * busy;
       dq.copy(IDLE.q).invert().premultiply(mq); _q2.identity().slerp(dq, wl);
       right.tp.set(handPos.x * nt + (mp.x - IDLE.p[0] * nt) * wl, handPos.y + (mp.y - IDLE.p[1]) * wl, handPos.z / lt + (mp.z - IDLE.p[2]) * wl);
       right.tq.copy(_q2).multiply(handQ);
@@ -5304,7 +5347,12 @@ var KarambitVM = (() => {
       moveTarget(left, fx, motion, nt, busy, mp, mq);
       left.tp.copy(mp); left.tp.y -= 0.35 * away; left.tq.copy(mq);
       const wf = Math.min(1, Wt.sprint + Wt.tac), wb = Math.min(1, Wt.slide + Wt.dive + Wt.recover), wa = Math.min(1, Wt.air + Wt.surf) * (1 - wb);
-      for (let j = 0; j < 21; j++) { let v = LF.relax[j]; v += (LF.fist[j] - v) * wf; v += (LF.air[j] - v) * wa; v += (LF.brace[j] - v) * wb; lf[j] = v; }
+      const fistWeight = wf * (1 - wb - wa);
+      for (let j = 0; j < 21; j++) {
+        const relaxed = LF.relax[j];
+        lf[j] = relaxed + (LF.fist[j] - relaxed) * fistWeight
+          + (LF.air[j] - relaxed) * wa + (LF.brace[j] - relaxed) * wb;
+      }
       applyAngles(left, lf);
       follow(left, dt);
       placeArm(left, left.sp, left.sq, anchor.set(-(0.34 + 0.05 * Wt.dive) * nt, -0.32, -0.055 - 0.055 * Wt.dive));
@@ -5335,12 +5383,12 @@ var KarambitVM = (() => {
     function render(renderer, P, fx, dt, camera, motion) { if (!held) update(P, fx, dt, motion, camera.aspect); draw(renderer, camera); }
     function reset(P) {
       for (const n in Wt) Wt[n] = 0;
-      turnX = turnY = accF = accR = 0; clock = 0; primed = !1; wasGrounded = !0; wasSlide = wasDive = !1;
+      turnX = turnY = accF = accR = 0; clock = 0; primed = !1; tipOk = !1; tipSpeed = 0; wasGrounded = !0; wasSlide = wasDive = !1;
       for (const h of hands) h.fresh = !0;
-      st.clip = CLIPS.equip; st.time = 0; st.queue = 0; st.still = 0;
+      st.clip = CLIPS.equip; st.time = 0; st.queue = 0; st.still = 0; st.fidgetIn = 3; st.nextInspect = 0;
     }
     function inspect() {
-      if (!st.clip || (st.clip.kind === "fidget" && st.time < 0.2)) { st.queue = 0; st.clip = pickInspect(); st.time = 0; }
+      if (!st.clip) { st.queue = 0; st.clip = pickInspect(); st.time = 0; }
       else st.queue = Math.min(1, st.queue + 1);
     }
     function setQuality(q) {
