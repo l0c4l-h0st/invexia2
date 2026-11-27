@@ -4193,8 +4193,13 @@ void main() {
      touches the handle or the palm, so fingers wrap the handle without
      passing through it.
    - The knife always hangs on the index finger by its ring (angle `theta`
-     around the finger, `slide` along it); the rare inspection throws it in a
-     ballistic flight around its centre of mass and catches it on the finger.
+     around the finger, `slide` along it). Spins are simulated as a pendulum on
+     the finger (slow at the top, fast at the bottom, braked into a pendulum
+     catch); the rare inspection throws the knife in a ballistic flight around
+     its centre of mass and catches it back on the finger.
+   - Both hands follow their targets through damped springs, so landings,
+     steps, flicks and catches ring out; movement poses (stride, sprint,
+     tactical sprint, slide, dive, air, surf) blend by state.
    Interface used by the game: { reset(player), render(renderer, player, cameraFx,
    dt, camera, motionScale), inspect(), setQuality({effects}) }.
    The three.js classes below are the bundle's minified names.
@@ -4589,53 +4594,123 @@ var KarambitVM = (() => {
       if (h === "idle") return { p: new Vec3(...IDLE.p), q: IDLE.q.clone() };
       if (h.e) return { p: new Vec3(...h.p), q: qEuler(...h.e) };
       if (h.f) return { p: new Vec3(...h.p), q: qBasis(h.f, h.b) };
-      if (h.knife) { // knife ring centre + knife orientation (blade direction, face normal), grip assumed
-        const { at, blade, face } = h.knife;
-        const zk = new Vec3(...face).normalize(), xk = new Vec3(...blade).normalize().negate();
-        xk.addScaledVector(zk, -xk.dot(zk)).normalize();
-        const kq = new Quat().setFromRotationMatrix(new Mat4().makeBasis(xk, new Vec3().crossVectors(zk, xk), zk));
-        const kp = new Vec3(), kqh = new Quat(), ks = new Vec3();
-        gripPose.km.decompose(kp, kqh, ks);
-        const q = kq.multiply(kqh.invert());
-        return { p: new Vec3(...at).sub(kp.applyQuaternion(q)), q };
-      }
       throw new Error("bad hand key");
     }
-    function resolveFingers(v) { const P = typeof v === "string" ? POSES[v] : v; return poseArray({ ...POSES.grip, ...P }); }
+    // finger poses: a pose name, or an object whose entries are angle arrays or pose names
+    const pose = (name, over = {}) => ({ ...POSES[name], ...over });
+    function resolveFingers(v) {
+      const P = typeof v === "string" ? POSES[v] : v, out = { ...POSES.grip };
+      for (const k of POSE_KEYS) if (P[k] !== void 0) out[k] = typeof P[k] === "string" ? POSES[P[k]][k] : P[k];
+      const a = poseArray(out);
+      if (a.length !== 21 || a.some((x) => !Number.isFinite(x))) throw new Error("bad finger pose " + JSON.stringify(v));
+      return a;
+    }
+    const COM_LOCAL = new Vec3(-0.1181, -0.0082, 0);   // knife-local centre of mass (unscaled: the matrices carry the scale)
+    // knife matrix in animation space at time t of a clip
+    function knifeAt(clip, t, out = new Mat4()) {
+      evalClip(clip, t); applyAngles(right, fa);
+      right.root.position.copy(handPos); right.root.quaternion.copy(handQ); right.root.updateMatrixWorld(!0);
+      return out.multiplyMatrices(right.fingers[0].mcp.matrixWorld, ringMatrix(kv[0] * DEG, kv[1] * MM, kv[2], kv[3] * DEG, new Mat4()));
+    }
     function compile(name, spec) {
+      // sort by time; keys sharing a time are merged (e.g. the end of a simulated spin and the start of a re-grip)
+      const keys = [];
+      for (const k of spec.keys.map((k, i) => [k, i]).sort((a, b) => a[0].t - b[0].t || a[1] - b[1]).map((x) => x[0])) {
+        const m = keys[keys.length - 1];
+        if (m && Math.abs(m.t - k.t) < 1e-6) Object.assign(m, k, { t: m.t, hold: [...(m.hold || []), ...(k.hold || [])] });
+        else keys.push({ ...k });
+      }
       const ch = { hand: [], fingers: [], knife: [], left: [] };
-      let last = {};
-      for (const K of spec.keys) {
+      let last = { theta: GRIP.theta, slide: GRIP.slide, ecc: [GRIP.ecc, GRIP.eccAng] };
+      for (const K of keys) {
         const hold = K.hold || [];
         if (K.hand !== void 0) { const r = resolveHand(K.hand); ch.hand.push({ t: K.t, p: r.p, q: r.q, hold: hold.includes("hand") }); }
         if (K.fingers !== void 0) ch.fingers.push({ t: K.t, v: resolveFingers(K.fingers), hold: hold.includes("fingers") });
         if (K.theta !== void 0 || K.slide !== void 0 || K.ecc !== void 0) {
-          const th = K.theta === "grip" ? GRIP.theta : K.theta ?? last.theta ?? GRIP.theta;
-          const sl = K.slide === "grip" ? GRIP.slide : K.slide ?? last.slide ?? GRIP.slide;
-          const ec = K.ecc === "grip" ? [GRIP.ecc, GRIP.eccAng] : K.ecc ?? last.ecc ?? [GRIP.ecc, GRIP.eccAng];
+          const th = K.theta ?? last.theta, sl = K.slide ?? last.slide, ec = K.ecc ?? last.ecc;
           last = { theta: th, slide: sl, ecc: ec };
           ch.knife.push({ t: K.t, v: [th, sl, ec[0], ec[1]], hold: hold.includes("knife"), vel: K.thetaVel != null ? [K.thetaVel] : null });
         }
         if (K.left !== void 0) ch.left.push({ t: K.t, v: [K.left] });
       }
-      const clip = { name, dur: spec.dur, kind: spec.kind || "inspect", lag: spec.lag || [0, 0.025, 0.045, 0.07, 0.01] };
+      const clip = { name, dur: spec.dur, kind: spec.kind || "inspect", lag: spec.lag || [0, 0.025, 0.045, 0.07, 0.01], events: [] };
       clip.pos = new Track(ch.hand.map((k) => ({ t: k.t, v: k.p.toArray(), hold: k.hold })));
       clip.rot = new QTrack(ch.hand.map((k) => ({ t: k.t, q: k.q, hold: k.hold })));
       clip.fingers = new Track(ch.fingers);
       clip.knife = new Track(ch.knife);
       clip.left = ch.left.length ? new Track(ch.left) : null;
       clip.toss = null;
-      if (spec.toss) { // free flight: the knife leaves the finger with its current motion and comes back after whole turns
-        const { t0, t1, turns = 1 } = spec.toss;
-        const ringAt = (t) => { evalClip(clip, t); applyAngles(right, fa); right.root.position.copy(handPos); right.root.quaternion.copy(handQ); right.root.updateMatrixWorld(!0);
-          return new Mat4().multiplyMatrices(right.fingers[0].mcp.matrixWorld, ringMatrix(kv[0] * DEG, kv[1] * MM, kv[2], kv[3] * DEG, new Mat4())); };
-        const M0 = ringAt(t0), Me = ringAt(t0 - 0.004), com = new Vec3(-0.1181, -0.0082, 0);
-        const c0 = com.clone().applyMatrix4(M0), v0 = c0.clone().sub(com.clone().applyMatrix4(Me)).divideScalar(0.004);
+      if (spec.toss) {
+        // Free flight: the knife leaves the finger with its own spin and turns about its centre of mass under
+        // vertical gravity. After `turns` the ring must be back where it left the finger, so the centre of mass
+        // travels dp = d - R(turns) d (d = ring - COM at the release); with half turns that is a short sideways drift.
+        const { t0, t1, turns = 1 } = spec.toss, T = t1 - t0;
+        const M0 = knifeAt(clip, t0), Me = knifeAt(clip, t0 - 0.004);
+        const c0 = COM_LOCAL.clone().applyMatrix4(M0), v0 = c0.clone().sub(COM_LOCAL.clone().applyMatrix4(Me)).divideScalar(0.004);
         const q0 = new Quat(), qe = new Quat(); M0.decompose(new Vec3(), q0, new Vec3()); Me.decompose(new Vec3(), qe, new Vec3());
-        const axis = qlog(q0.clone().multiply(qe.invert()), new Vec3()).normalize();
-        clip.toss = { t0, t1, turns, M0, c0, v0, g: v0.clone().multiplyScalar(-2 / (t1 - t0)), axis, spin: TAU * turns / (t1 - t0) };
+        const axis = qlog(q0.clone().multiply(qe.invert()), new Vec3()).normalize(), spin = TAU * turns / T;
+        const d = new Vec3().setFromMatrixPosition(M0).sub(c0), dp = d.clone().sub(d.clone().applyAxisAngle(axis, spin * T));
+        const gy = 2 * (v0.y - dp.y / T) / T;
+        clip.toss = { t0, t1, turns, M0, c0, v0: new Vec3(dp.x / T, v0.y, dp.z / T), g: new Vec3(0, -gy, 0), axis, spin, dp };
+      }
+      // impulses on the hand: the handle slapping into the palm pushes it along the knife's motion; flicks spin the wrist
+      for (const K of keys) {
+        if (K.impact) { // momentum of the knife just before it stops, handed to the wrist
+          const a = knifeAt(clip, K.t - 0.015), b = knifeAt(clip, K.t - 0.027), qa = new Quat(), qb = new Quat();
+          a.decompose(_v1, qa, _v2); b.decompose(_v1, qb, _v2);
+          clip.events.push({ t: K.t, v: COM_LOCAL.clone().applyMatrix4(a).sub(COM_LOCAL.clone().applyMatrix4(b)).multiplyScalar(K.impact / 0.012),
+            w: qlog(qa.multiply(qb.invert()), new Vec3()).multiplyScalar(K.impact * 0.6 / 0.012) });
+        }
+        if (K.kick) clip.events.push({ t: K.t, v: K.kick.v ? new Vec3(...K.kick.v) : null, w: K.kick.w ? new Vec3(...K.kick.w) : null });
       }
       CLIPS[name] = clip; return clip;
+    }
+
+    /* ---------- knife physics on the finger ----------
+       The knife swings around the index like a pendulum: phi is the angle of its centre of mass from
+       "hanging straight down", in the plane of the ring. A spin slows near the top and speeds up at
+       the bottom; the hand brakes the last part of the turn into a short pendulum swing before the
+       re-grip. Spins are integrated once at start-up and stored as dense keys. */
+    const COM_FLIP = Math.atan2(-COM_LOCAL.y, COM_LOCAL.x);   // COM direction in the ring frame (FLIP mirrors y)
+    const GL = 9.81 / 0.165;                                  // g / equivalent pendulum length of the knife on the finger (1/s²)
+    function hangOf(hand, fingers) { // theta at which the knife hangs straight down for a hand pose, and the in-plane share of gravity
+      const r = resolveHand(hand); applyAngles(right, resolveFingers(fingers));
+      right.root.position.copy(r.p); right.root.quaternion.copy(r.q); right.root.updateMatrixWorld(!0);
+      const q = new Quat(); right.fingers[0].mcp.matrixWorld.decompose(new Vec3(), q, new Vec3());
+      const g = new Vec3(0, -1, 0).applyQuaternion(q.invert());
+      let hang = (Math.atan2(g.y, g.x) - COM_FLIP) / DEG; hang -= 360 * Math.round((hang - 90) / 360);
+      return { hang, mg: Math.hypot(g.x, g.y) };
+    }
+    function simulateSpin(o) {
+      const keys = [], G = GL * o.mg, h = 1 / 960, stop = o.stop();
+      let phi = (o.theta - o.hang) * DEG, w = o.omega * DEG, t = o.t, next = o.t, phiMin = phi, done = !1;
+      const key = () => keys.push({ t: +t.toFixed(4), theta: o.hang + phi / DEG, thetaVel: w / DEG, ...(o.extra && o.extra(t)) });
+      for (let i = 0; i < 4320 && !done; i++) {
+        if (t >= next - 1e-9) { key(); next += 1 / 90; }
+        w += (-G * Math.sin(phi) + o.torque(phi, w)) * h; phi += w * h; t += h;
+        if (phi < phiMin) phiMin = phi;
+        done = stop(phi, w);
+      }
+      key();
+      return { keys, end: keys[keys.length - 1].t, theta: o.hang + phi / DEG, vel: w / DEG, phiMin, done };
+    }
+    // stop once the knife has gone past `bottom`, turned back, and crossed it again
+    const swingBack = (bottom) => () => { let passed = !1, turned = !1; return (phi, w) => ((passed ||= phi < bottom), (turned ||= passed && w > 0), turned && phi >= bottom); };
+    const reach = (target) => () => (phi) => phi <= target;
+    function bisect(f, lo, hi, n = 34) { for (let i = 0; i < n; i++) { const m = (lo + hi) / 2; if (f(m) > 0) hi = m; else lo = m; } return (lo + hi) / 2; }
+    // spin, then brake so the knife overshoots the bottom by `overshoot` degrees and swings back
+    function spinToCatch(o) {
+      const run = (c, extra) => simulateSpin({ ...o, extra, torque: (phi, w) => -(phi < o.brakeFrom ? c : o.damp) * w, stop: swingBack(o.bottom) });
+      const c = bisect((c) => o.overshoot + (run(c).phiMin - o.bottom) / DEG, 0, 60);
+      const first = run(c);
+      return o.extra ? run(c, (t) => o.extra(t, first.end)) : first;
+    }
+    // pump the spin (constant drive) so the knife reaches `release` with the wanted speed
+    function spinToRelease(o) {
+      const run = (D, extra) => simulateSpin({ ...o, extra, torque: (phi, w) => -o.damp * w - D, stop: reach(o.release) });
+      const D = bisect((D) => { const r = run(D); return r.done ? -r.vel * DEG - o.speed : -o.speed - 1; }, 0, 120);
+      const first = run(D);
+      return o.extra ? run(D, (t) => o.extra(t, first.end)) : first;
     }
 
     /* ---------- clip library ----------
@@ -4643,79 +4718,119 @@ var KarambitVM = (() => {
        hand: "idle" | {p, f: finger direction, b: back-of-hand direction} | {p, e: Euler XYZ}
        theta: knife angle around the index finger (decreasing = clockwise seen from the player),
        slide: ring position along the index (mm), ecc: [ring play 0..1, direction].
-       Every clip starts and ends in the grip; the collision checker keeps every frame clip-free. */
+       impact / kick: impulses on the hand (follow-through). Every clip starts and ends in the grip;
+       the collision checker keeps every frame clip-free. */
     const G = GRIP.theta, ECC = [GRIP.ecc, GRIP.eccAng];
     const HOOK = { m: [7, 20, 30, 15], r: [10, 22, 32, 16], p: [14, 24, 34, 18], t: [0, 38, -10, 4, 8] };
     const LETGO = { ...HOOK, i: [-8, 70, 40, 25] };          // middle/ring/pinky let go of the handle
     const OPEN_IDX = { ...HOOK, i: [-14, 40, 15, 8] };       // index opens, splayed away from the middle finger
     const SEMI = { i: [-12, 4, 6, 4], m: [9, 32, 42, 22], r: [11, 34, 44, 24], p: [15, 36, 46, 26], t: [0, 38, -10, 4, 8] };
-    const SPIN_HAND = { p: [0.1, -0.12, -0.38], f: [-0.25, 0.3, -0.92], b: [0.05, 0.95, 0.3] };
+    const SPIN_I = pose("spin", { i: [-6, 2, 0, 0] });      // straight index for the toss
+    const loosen = (a) => { const g = POSES.grip, o = { t: [...g.t] }; for (const k of ["m", "r", "p"]) o[k] = [g[k][0], g[k][1] - a, g[k][2] - 1.4 * a, g[k][3] - a]; o.t[4] -= a; return o; };
+    const twist = (h, deg, dp = [0, 0, 0]) => ({ p: h.p.map((x, i) => x + dp[i]), f: h.f, b: new Vec3(...h.b).applyAxisAngle(new Vec3(...h.f).normalize(), deg * DEG).toArray() });
+    const flick = (h, w) => ({ w: new Vec3(...h.f).normalize().multiplyScalar(w).toArray() });   // clockwise wrist flick
+    const eccAt = (t, t0, t1) => { const a = sstep(t, t0, t0 + 0.14) * (1 - sstep(t, t1 - 0.3, t1)); return [lerp(ECC[0], 1, a), lerp(ECC[1], 0, a)]; };
     // grip -> knife hanging from the extended index (the handle drops on the thumb side, clear of the fingers)
-    const release = (t, hand) => [
+    const release = (t, hand, hang) => [
       { t, hand, fingers: "grip", theta: G, slide: 31, ecc: ECC },
       { t: t + 0.07, fingers: LETGO },
-      { t: t + 0.15, fingers: OPEN_IDX, theta: 125, slide: 34 },
-      { t: t + 0.25, fingers: SEMI, theta: 90, slide: 40, ecc: ECC },
+      { t: t + 0.15, fingers: OPEN_IDX, theta: (G + hang) / 2 + 1, slide: 34 },
+      { t: t + 0.25, fingers: SEMI },
     ];
-    // the same path played backwards: hanging knife (theta = base) swings into the palm and the fingers close
-    const regrip = (t, base, hand) => [
-      { t, theta: base, fingers: SEMI, ecc: ECC },
-      { t: t + 0.08, fingers: OPEN_IDX, theta: base + 35, slide: 34 },
-      { t: t + 0.16, fingers: LETGO, theta: base + 68, slide: 31, ...(hand && { hand }) },
+    // the same path backwards: the knife swings back up into the palm and the fingers close on it
+    const regrip = (t, base, end, hand) => [
+      { t, fingers: SEMI },
+      { t: t + 0.08, fingers: OPEN_IDX, theta: (base + end) / 2 + 1, slide: 34 },
+      { t: t + 0.145, theta: end - 2, thetaVel: 380, slide: 31.3, ...(hand && { hand }) },            // the handle slaps into the palm...
+      { t: t + 0.16, fingers: LETGO, theta: end, thetaVel: 0, slide: 31, ecc: ECC, impact: 0.7 },     // ...and stops dead
       { t: t + 0.26, fingers: "grip" },
     ];
-    const TOSS_HAND = { p: [0.08, -0.13, -0.4], f: [-0.2, 0.28, -0.94], b: [0.03, 0.96, 0.28] };
-    const TOSS_BACK = { ...TOSS_HAND, p: [0.087, -0.152, -0.371] };   // finger pulled back out of the ring
-    const TOSS_T0 = 1.75, TOSS_T1 = TOSS_T0 + 360 / 785;               // exactly one turn at 785 deg/s
+    const SPIN_HAND = { p: [0.1, -0.12, -0.38], f: [-0.25, 0.3, -0.92], b: [0.05, 0.95, 0.3] };
+    const FACE_B = { p: [0.075, -0.105, -0.335], f: [-0.22, 0.92, -0.32], b: [0.18, 0.28, 1] };
+    const FACE_B2 = { p: [0.07, -0.098, -0.33], f: [-0.32, 0.9, -0.28], b: [0.05, 0.32, 1] };
+    const EDGE = { p: [0.075, -0.1, -0.33], f: [-0.05, 0.95, -0.3], b: [0.95, 0.1, -0.1] };
+    const FACE_A = { p: [0.07, -0.095, -0.325], f: [0.12, 0.94, -0.3], b: [-0.2, -0.25, -1] };
+    const FACE_A2 = { p: [0.075, -0.1, -0.33], f: [0.2, 0.93, -0.3], b: [-0.1, -0.28, -1] };
+    const TOSS_HAND = { p: [0.085, -0.158, -0.45], f: [-0.2, 0.28, -0.94], b: [0.03, 0.96, 0.28] };   // a bit lower and further: the toss climbs 25 cm
+    const TOSS_BACK = { ...TOSS_HAND, p: [0.091, -0.18, -0.422] };    // finger pulled back out of the ring
+    const FID_HAND = { ...SPIN_HAND, p: [0.115, -0.14, -0.38], f: [-0.27, 0.32, -0.91] };
+    const EQ_HAND = { ...SPIN_HAND, p: [0.11, -0.125, -0.375], f: [-0.25, 0.32, -0.92] };
+
+    // main inspection spin: flick from hanging, one turn, braked into a pendulum catch
+    const HS = hangOf(SPIN_HAND, "spin");
+    const s1 = spinToCatch({ t: 3.8, hang: HS.hang, mg: HS.mg, theta: HS.hang, omega: -980, damp: 0.45, bottom: -TAU, brakeFrom: -1.2 * Math.PI, overshoot: 26,
+      extra: (t, end) => ({ slide: 40, ecc: eccAt(t, 3.8, end) }) });
+    // rare inspection: pump the spin, release at 1000 deg/s while the centre of mass climbs on the thumb side,
+    // one and a half turns in the air, and the ring lands back on the finger while the knife falls on the pinky side
+    // (the ring is the slowest point of the knife at both moments, so the finger slides in and the spin carries on)
+    const TOSS_SPEED = 1000, HT = hangOf(TOSS_HAND, SPIN_I);
+    const r1 = spinToRelease({ t: 0.65, hang: HT.hang, mg: HT.mg, theta: HT.hang, omega: -900, damp: 0.45, release: -2.5 * Math.PI, speed: TOSS_SPEED * DEG,
+      extra: (t, end) => ({ slide: lerp(40, 94, sstep(t, end - 0.55, end - 0.13)), ecc: eccAt(t, 0.65, 1e9) }) });
+    const T0 = r1.end, T1 = +(T0 + 540 / TOSS_SPEED).toFixed(4), phiCatch = (r1.theta - 540 - HT.hang) * DEG;
+    const r2 = spinToCatch({ t: T1, hang: HT.hang, mg: HT.mg, theta: r1.theta - 540, omega: r1.vel, damp: 0.45, bottom: phiCatch - 2.5 * Math.PI, brakeFrom: phiCatch - 1.7 * Math.PI, overshoot: 24,
+      extra: (t, end) => { const a = sstep(t, T1, T1 + 0.08), b = sstep(t, end - 0.3, end);   // the ring settles on the far side of the finger, then back to the grip side
+        return { slide: lerp(94, 40, sstep(t, T1 + 0.05, T1 + 0.5)), ecc: [lerp(1, ECC[0], b), lerp(lerp(180, 0, a), ECC[1], b)] }; } });
+    const rareBase = HT.hang + (phiCatch - 2.5 * Math.PI) / DEG;
+    // quick idle spin
+    const HF = hangOf(FID_HAND, "spin");
+    const f2 = spinToCatch({ t: 0.45, hang: HF.hang, mg: HF.mg, theta: HF.hang, omega: -1010, damp: 0.5, bottom: -TAU, brakeFrom: -1.2 * Math.PI, overshoot: 20,
+      extra: (t, end) => ({ slide: 40, ecc: eccAt(t, 0.45, end) }) });
+    const HE = hangOf(EQ_HAND, "spin");
+
     const SPECS = {
       idle: { dur: 1, kind: "idle", keys: [{ t: 0, hand: "idle", fingers: "grip", theta: G, left: 0 }, { t: 1, hand: "idle", fingers: "grip", theta: G, left: 0 }] },
-      // main inspection: back of the hand, roll over to the palm side, then a ring spin and a pendulum catch
-      inspect: { dur: 5.45, kind: "inspect", keys: [
+      // main inspection: back of the hand, roll over to the palm side (re-gripping on the way), then a ring spin
+      inspect: { dur: s1.end + 0.84, kind: "inspect", keys: [
         { t: 0, hand: "idle", fingers: "grip", theta: G, slide: 31, ecc: ECC, left: 0 },
+        { t: 0.14, hand: { p: [0.134, -0.181, -0.358], e: [0.47, 0.35, -0.09] } },     // anticipation: small dip before the lift
         { t: 0.25, left: 1 },
-        { t: 0.5, hand: { p: [0.075, -0.105, -0.335], f: [-0.22, 0.92, -0.32], b: [0.18, 0.28, 1] } },     // face B
-        { t: 1.45, hand: { p: [0.07, -0.098, -0.33], f: [-0.32, 0.9, -0.28], b: [0.05, 0.32, 1] } },
-        { t: 1.95, hand: { p: [0.075, -0.1, -0.33], f: [-0.05, 0.95, -0.3], b: [0.95, 0.1, -0.1] } },      // edge on
-        { t: 2.35, hand: { p: [0.07, -0.095, -0.325], f: [0.12, 0.94, -0.3], b: [-0.2, -0.25, -1] } },     // face A
-        { t: 3.1, hand: { p: [0.075, -0.1, -0.33], f: [0.2, 0.93, -0.3], b: [-0.1, -0.28, -1] } },
-        ...release(3.55, SPIN_HAND),
-        { t: 3.94, fingers: "spin", ecc: [1, 0], theta: 52 },
-        { t: 4.08, theta: 0 },
-        { t: 4.26, theta: -150 },
-        { t: 4.42, theta: -262, hand: { ...SPIN_HAND, p: [0.1, -0.115, -0.385], f: [-0.25, 0.32, -0.92] }, fingers: "spin" },
-        { t: 4.52, theta: -290, hold: ["knife"] },                                                        // pendulum overshoot
-        ...regrip(4.62, -270),
-        { t: 4.95, left: 1 },
-        { t: 5.45, hand: "idle", fingers: "grip", theta: G - 360, left: 0 },
+        { t: 0.55, hand: FACE_B },
+        { t: 1.45, hand: FACE_B2 },
+        { t: 1.62, fingers: loosen(7) },                                                // grip relaxes to turn the wrist
+        { t: 1.95, hand: EDGE },
+        { t: 2.2, fingers: "grip" },
+        { t: 2.35, hand: FACE_A },
+        { t: 3.1, hand: FACE_A2 },
+        { t: 3.42, hand: twist(SPIN_HAND, -12, [0.004, -0.006, 0.004]) },            // wrist cocks before the flick
+        ...release(3.55, SPIN_HAND, HS.hang),
+        { t: 3.8, kick: flick(SPIN_HAND, 2.6) },
+        { t: 3.94, fingers: "spin" },
+        ...s1.keys,
+        { t: s1.end - 0.2, fingers: "spin" },                                          // fist stays closed until the catch
+        ...regrip(s1.end, HS.hang - 360, G - 360),
+        { t: s1.end + 0.33, left: 1 },
+        { t: s1.end + 0.84, hand: "idle", fingers: "grip", theta: G - 360, left: 0 },
       ] },
       // rare inspection: spin, toss (free flight, one turn around the centre of mass), ring caught on the index
-      inspectRare: { dur: 3.7, kind: "inspect", toss: { t0: TOSS_T0, t1: TOSS_T1, turns: 1 }, keys: [
+      inspectRare: { dur: r2.end + 0.86, kind: "inspect", toss: { t0: T0, t1: T1, turns: 1.5 }, keys: [
         { t: 0, hand: "idle", fingers: "grip", theta: G, slide: 31, ecc: ECC, left: 0 },
+        { t: 0.14, hand: { p: [0.132, -0.18, -0.36], e: [0.45, 0.34, -0.1] } },
         { t: 0.25, left: 1 },
-        ...release(0.4, TOSS_HAND),
-        { t: 0.79, fingers: { i: [-6, 2, 0, 0], m: "spin" }, theta: 52, ecc: [1, 0] },
-        { t: 0.95, theta: -60 },
-        { t: 1.2, theta: -290, slide: 40 },
-        { t: 1.45, theta: -520 },
-        { t: 1.62, slide: 94 },                                                                          // ring slides to the fingertip
-        { t: TOSS_T0, hand: TOSS_HAND, theta: -720, thetaVel: -785, slide: 94 },
-        { t: TOSS_T0 + 0.04, hand: TOSS_BACK },
-        { t: TOSS_T1 - 0.045, hand: TOSS_BACK },
-        { t: TOSS_T1, hand: TOSS_HAND, theta: -1080, thetaVel: -785, slide: 94 },
-        { t: 2.45, theta: -1240, slide: 45 },
-        { t: 2.65, theta: -1350, slide: 40 },
-        { t: 2.75, theta: -1378, hold: ["knife"] },
-        ...regrip(2.85, -1350),
-        { t: 3.2, left: 1 },
-        { t: 3.7, hand: "idle", fingers: "grip", theta: G - 1440, left: 0 },
+        ...release(0.4, TOSS_HAND, HT.hang),
+        { t: 0.65, kick: flick(TOSS_HAND, 2.2) },
+        { t: 0.79, fingers: SPIN_I },
+        ...r1.keys,
+        { t: T1, theta: r1.theta - 540, thetaVel: r1.vel },
+        { t: T0, hand: TOSS_HAND },
+        { t: T0 + 0.05, hand: TOSS_BACK },                                              // finger slips out of the ring
+        { t: T1 - 0.06, hand: { ...TOSS_BACK, p: [TOSS_BACK.p[0] - 0.02, TOSS_BACK.p[1] + 0.004, TOSS_BACK.p[2]] } },
+        { t: T1, hand: TOSS_HAND },                                                     // ...and back in, moving with the ring
+        { t: T1 + 0.1, hand: { ...TOSS_HAND, p: [TOSS_HAND.p[0] + 0.006, TOSS_HAND.p[1] - 0.012, TOSS_HAND.p[2]] } },   // absorbs the catch
+        { t: T1 + 0.32, hand: TOSS_HAND },
+        ...r2.keys,
+        { t: r2.end - 0.2, fingers: SPIN_I },
+        ...regrip(r2.end, rareBase, G - 1440),
+        { t: r2.end + 0.35, left: 1 },
+        { t: r2.end + 0.86, hand: "idle", fingers: "grip", theta: G - 1440, left: 0 },
       ] },
       // draw: the knife arrives spinning on the index and is caught into the grip
       equip: { dur: 0.98, kind: "equip", keys: [
-        { t: 0, hand: { p: [0.17, -0.34, -0.36], f: [-0.3, 0.55, -0.78], b: [0.25, 0.8, 0.5] }, fingers: "spin", theta: 120, slide: 40, ecc: [1, 0], left: 0 },
-        { t: 0.18, theta: 20 },
-        { t: 0.4, hand: { ...SPIN_HAND, p: [0.11, -0.125, -0.375], f: [-0.25, 0.32, -0.92] }, theta: -262 },
-        { t: 0.48, theta: -286, hold: ["knife"], fingers: "spin" },
-        ...regrip(0.56, -270),
+        { t: 0, hand: { p: [0.17, -0.34, -0.36], f: [-0.3, 0.55, -0.78], b: [0.25, 0.8, 0.5] }, fingers: "spin", theta: HE.hang + 30, slide: 40, ecc: [1, 0], left: 0 },
+        { t: 0.18, theta: HE.hang - 70 },
+        { t: 0.4, hand: EQ_HAND, theta: HE.hang - 352 },
+        { t: 0.48, theta: HE.hang - 376, hold: ["knife"], fingers: "spin" },
+        { t: 0.56, theta: HE.hang - 360, ecc: ECC },
+        ...regrip(0.56, HE.hang - 360, G - 360),
         { t: 0.98, hand: "idle", fingers: "grip", theta: G - 360, left: 0 },
       ] },
       // idle fidgets while standing still
@@ -4727,23 +4842,22 @@ var KarambitVM = (() => {
         { t: 0.85, hand: { p: [0.131, -0.174, -0.364], e: [0.4, 0.32, -0.07] } },
         { t: 1.25, hand: "idle", fingers: "grip", theta: G },
       ] },
-      fidget2: { dur: 1.55, kind: "fidget", keys: [
+      fidget2: { dur: f2.end + 0.45, kind: "fidget", keys: [
         { t: 0, hand: "idle", fingers: "grip", theta: G, slide: 31, ecc: ECC },
-        ...release(0.2, { ...SPIN_HAND, p: [0.115, -0.14, -0.38], f: [-0.27, 0.32, -0.91] }),
-        { t: 0.58, fingers: "spin", theta: 40, ecc: [1, 0] },
-        { t: 0.78, theta: -150 },
-        { t: 0.92, theta: -262, fingers: "spin" },
-        { t: 1.01, theta: -284, hold: ["knife"] },
-        ...regrip(1.1, -270, { ...SPIN_HAND, p: [0.115, -0.14, -0.38], f: [-0.27, 0.32, -0.91] }),
-        { t: 1.55, hand: "idle", fingers: "grip", theta: G - 360 },
+        ...release(0.2, FID_HAND, HF.hang),
+        { t: 0.45, kick: flick(FID_HAND, 2) },
+        { t: 0.58, fingers: "spin" },
+        ...f2.keys,
+        { t: f2.end - 0.2, fingers: "spin" },
+        ...regrip(f2.end, HF.hang - 360, G - 360, FID_HAND),
+        { t: f2.end + 0.45, hand: "idle", fingers: "grip", theta: G - 360 },
       ] },
     };
     for (const [n, s] of Object.entries(SPECS)) compile(n, s);
 
     /* ---------- runtime state ---------- */
     const st = { clip: CLIPS.equip, time: 0, queue: 0, still: 0, fidgetIn: 3, rareStreak: 0, lastRare: !1, frozen: !1 };
-    let yaw0 = 0, pitch0 = 0, swayX = 0, swayY = 0, walk = 0, tac = 0, slide = 0, dive = 0, air = 0, clock = 0;
-    const dbgCam = new Ue(30, 1, 0.005, 5); let view = null;
+    const dbgCam = new Ue(30, 1, 0.005, 5); let view = null, held = !1;
 
     function pickInspect() {
       const rare = CLIPS.inspectRare && !st.lastRare && (st.rareStreak >= 4 || Math.random() < 0.22);
@@ -4752,7 +4866,9 @@ var KarambitVM = (() => {
     }
     function advance(dt, still) {
       if (st.frozen) return;
+      const c0 = st.clip, t0 = st.time;
       st.time += dt;
+      if (c0) for (const e of c0.events) if (e.t > t0 && e.t <= st.time) kick(right, e.v, e.w);
       if (st.clip && st.time >= st.clip.dur) {
         if (st.queue > 0) { st.queue--; st.clip = pickInspect(); st.time = 0; }
         else { st.clip = null; st.time = 0; }
@@ -4780,8 +4896,8 @@ var KarambitVM = (() => {
       }
     }
 
-    /* ---------- per-frame ---------- */
-    const kv2 = new Float64Array(4), tug = new Vec3(), kmat = new Mat4(), fdir = new Vec3(), hz = new Vec3(), swing = new Quat(), fq = new Quat();
+    /* ---------- arms ---------- */
+    const kv2 = new Float64Array(4), tug = new Vec3(), kmat = new Mat4(), fdir = new Vec3(), hz = new Vec3(), swing = new Quat(), fq = new Quat(), ONE = new Vec3(1, 1, 1);
     function placeArm(hand, pos, q, anchor) {
       hand.root.position.copy(pos); hand.root.quaternion.copy(q);
       // forearm direction: towards the shoulder anchor, bent at the wrist only within anatomical limits
@@ -4807,13 +4923,78 @@ var KarambitVM = (() => {
       return out.multiplyMatrices(right.fingers[0].mcp.matrixWorld, ringMatrix(kv[0] * DEG, kv[1] * MM, kv[2], kv[3] * DEG, _m2));
     }
 
-    function render(renderer, P, fx, dt, camera, motion) {
-      const aspect = camera.aspect;
-      _q1.copy(camera.quaternion).invert();
-      key.position.copy(keyDir).applyQuaternion(_q1);
-      scene.environmentRotation.setFromQuaternion(_q1);
-      if (cam.aspect !== aspect) { cam.aspect = aspect; cam.updateProjectionMatrix(); }
-      const k = 1 - Math.exp(-13 * dt), sp = Math.hypot(P.vx, P.vz);
+    /* ---------- follow-through: each hand tracks its target through a damped spring ----------
+       Gives weight to fast moves, and lets impulses (landings, steps, catches, flicks) ring out. */
+    const SPRING_W = TAU * 8, SPRING_Z = 0.7;
+    for (const h of hands) Object.assign(h, { sp: new Vec3(), sv: new Vec3(), sq: new Quat(), sw: new Vec3(), tp: new Vec3(), tq: new Quat(), fresh: !0 });
+    function kick(h, v, w) { if (v) h.sv.add(v); if (w) h.sw.add(w); }
+    function follow(h, dt) {
+      if (h.fresh) { h.sp.copy(h.tp); h.sq.copy(h.tq); h.sv.set(0, 0, 0); h.sw.set(0, 0, 0); h.fresh = !1; return; }
+      const W2 = SPRING_W * SPRING_W, D = 2 * SPRING_Z * SPRING_W;
+      for (let left = Math.min(dt, 0.1); left > 1e-7; ) {
+        const s = Math.min(left, 1 / 240); left -= s;
+        _v1.subVectors(h.tp, h.sp).multiplyScalar(W2).addScaledVector(h.sv, -D);
+        h.sv.addScaledVector(_v1, s); h.sp.addScaledVector(h.sv, s);
+        qlog(_q1.copy(h.tq).multiply(_q2.copy(h.sq).invert()), _v2);
+        _v2.multiplyScalar(W2).addScaledVector(h.sw, -D);
+        h.sw.addScaledVector(_v2, s);
+        h.sq.premultiply(qexp(_v3.copy(h.sw).multiplyScalar(s), _q1)).normalize();
+      }
+    }
+
+    /* ---------- movement poses ----------
+       Offsets from the idle pose blended by smoothed state weights: either additive [x, y, z, rotX, rotY, rotZ]
+       (metres / radians, camera space) or an absolute orientation { dp: position offset, f: finger direction,
+       b: back-of-hand direction } for poses that turn the hand over (hand reaching for the ground, knife raised...).
+       The stride swings the arms in opposition. */
+    const MOVE = {
+      sprint: { R: [-0.016, -0.034, 0.03, 0.32, 0.16, -0.26], L: [0.012, -0.03, 0.03, 0.22, -0.1, 0.18] },
+      tac: { R: { dp: [-0.035, 0.045, 0.05], f: [-0.55, 0.45, -0.7], b: [0.55, 0.65, 0.5] }, L: [0.02, -0.02, 0.02, 0.3, -0.2, 0.25] },   // knife held up, clear of the centre
+      crouch: { R: [0, -0.012, 0.004, 0.04, 0, 0], L: [0, -0.012, 0.004, 0.04, 0, 0] },
+      slide: { R: [0.028, -0.03, -0.06, -0.22, -0.05, -0.34], L: { dp: [0.015, -0.045, -0.07], f: [0.32, -0.3, -0.9], b: [0, 0.95, -0.3] } },   // left hand reaches for the ground
+      dive: { R: [-0.03, 0.06, -0.13, -0.5, -0.25, -0.2], L: { dp: [0.065, 0.07, -0.14], f: [0.2, 0.15, -0.97], b: [0, 0.9, 0.3] } },
+      recover: { R: [0, -0.045, -0.04, 0.3, 0, -0.1], L: { dp: [0.02, -0.075, -0.05], f: [0.3, -0.4, -0.87], b: [0, 0.92, -0.4] } },   // pushes off the ground after a dive
+      air: { R: [0.008, 0.022, -0.025, -0.06, 0, 0.05], L: [-0.012, 0.022, -0.025, -0.06, 0, -0.08] },
+      surf: { R: [0.022, 0.012, -0.01, -0.05, 0.05, 0.12], L: [-0.035, 0.02, -0.02, -0.08, -0.1, -0.2] },
+    };
+    const prepMove = () => { for (const k in MOVE) for (const sd of ["R", "L"]) { const o = MOVE[k][sd]; if (!Array.isArray(o)) o.q = qBasis(o.f, o.b); } };
+    prepMove();
+    const Wt = { move: 0, sprint: 0, tac: 0, crouch: 0, slide: 0, dive: 0, recover: 0, air: 0, surf: 0 };
+    const LF = {
+      relax: poseArray(POSES.relax),
+      fist: poseArray(POSES.relax).map((v, i) => lerp(v, poseArray(POSES.fist)[i], 0.65)),
+      brace: poseArray({ i: [-10, 2, 4, 2], m: [-2, 0, 4, 2], r: [6, 2, 4, 2], p: [14, 4, 6, 3], t: [0, 40, -10, 0, 0] }),
+      air: poseArray({ i: [-6, 14, 20, 10], m: [0, 16, 22, 12], r: [4, 18, 24, 12], p: [9, 20, 26, 14], t: [6, 24, 0, 8, 10] }),
+    };
+    const lf = new Float64Array(21);
+    let yaw0 = 0, pitch0 = 0, clock = 0, turnX = 0, turnY = 0, accF = 0, accR = 0, vF0 = 0, vR0 = 0, wasGrounded = !0, wasSlide = !1, wasDive = !1, primed = !1;
+    function moveTarget(h, fx, motion, nt, busy, outP, outQ) {
+      const s = h.side, R = s === 1, base = R ? IDLE : IDLE_L, key = R ? "R" : "L";
+      let x = base.p[0] * nt, y = base.p[1], z = base.p[2], rx = R ? 0.39 : 0.32, ry = R ? 0.31 : -0.21, rz = R ? -0.035 : -0.65;
+      for (const k in MOVE) {
+        const w = Wt[k], o = MOVE[k][key]; if (w < 1e-3) continue;
+        if (Array.isArray(o)) { x += o[0] * w * nt; y += o[1] * w; z += o[2] * w; rx += o[3] * w; ry += o[4] * w; rz += o[5] * w; }
+        else { x += o.dp[0] * w * nt; y += o.dp[1] * w; z += o.dp[2] * w; }
+      }
+      // stride: arms swing in opposition and the wrist rocks with the swing
+      const sw = Math.sin(fx.phase * Math.PI) * s, A = Wt.move * (0.006 + 0.011 * Wt.sprint + 0.02 * Wt.tac) * motion;
+      z -= A * sw; y += A * (0.45 * Math.abs(sw) - 0.2); x += A * 0.3 * sw * s; rx += A * 4 * sw; rz -= A * 3 * sw * s;
+      // inertia: the hands lag behind the view and behind the body's acceleration
+      x += clamp(turnX * 0.012, -0.03, 0.03) * motion; y -= clamp(turnY * 0.008, -0.02, 0.02) * motion;
+      ry -= clamp(turnX * 0.03, -0.12, 0.12) * motion; rx -= clamp(turnY * 0.03, -0.1, 0.1) * motion;
+      z += clamp(accF * 0.0018, -0.02, 0.02) * motion; x -= clamp(accR * 0.0014, -0.016, 0.016) * motion;
+      // breathing while idle
+      const br = motion * (1 - busy) * (1 - Wt.move), B = Math.sin(clock * 1.7);
+      y += (0.004 * B + 0.0025 * Math.sin(clock * 3.4 + s)) * br; z += 0.004 * Math.sin(clock * 1.7 + s) * br;
+      rx += 0.03 * B * br; rz += 0.02 * Math.sin(clock * 1.1 + s) * br;
+      outP.set(x, y, z); outQ.setFromEuler(_e.set(rx, ry, rz, "XYZ"));
+      for (const k in MOVE) { const w = Wt[k], o = MOVE[k][key]; if (w > 1e-3 && !Array.isArray(o)) outQ.slerp(o.q, w); }
+    }
+
+    /* ---------- per-frame update ---------- */
+    const mp = new Vec3(), mq = new Quat(), dq = new Quat(), anchor = new Vec3();
+    function update(P, fx, dt, motion, aspect) {
+      const sp = Math.hypot(P.vx, P.vz);
       const still = P.grounded && sp < 0.3 && !P.slide && !P.diving && !P.recovery;
       advance(dt, still);
       clock = (clock + dt) % (Math.PI * 200);
@@ -4822,61 +5003,70 @@ var KarambitVM = (() => {
       const active = st.clip ? sstep(t, 0, 0.22) * (1 - sstep(t, clip.dur - 0.28, clip.dur)) : 0;
       const busy = st.clip && st.clip.kind !== "idle" ? active : 0;
 
-      // locomotion state (same feel as before)
-      const wk = P.grounded && P.state !== "surf" && !P.low ? Math.min(1, sp / 10) : 0;
-      walk += (wk - walk) * k; tac += (+(P.state === "tactical") - tac) * k; slide += (+P.slide - slide) * k;
-      dive += (+(P.diving || P.recovery > 0) - dive) * k; air += (+(!P.grounded && !P.diving) - air) * k;
-      const dyaw = Math.atan2(Math.sin(P.yaw - yaw0), Math.cos(P.yaw - yaw0)), inv = 1 / Math.max(dt, 1 / 240);
-      swayX += (clamp(dyaw * inv * 0.022, -0.045, 0.045) - swayX) * k;
-      swayY += (clamp((P.pitch - pitch0) * inv * -0.014, -0.026, 0.026) - swayY) * k;
-      yaw0 = P.yaw; pitch0 = P.pitch;
-      const nt = Math.min(1, aspect / 1.4), lt = Math.min(1, aspect / 1.3);
-      const B = Math.sin(clock * 1.7), breathe = motion * (1 - busy);
-
-      for (const hand of hands) {
-        const s = hand.side, R = s === 1;
-        const tt = Math.sin(fx.phase * Math.PI) * s * walk, Mt = s === fx.slideSide ? slide : 0;
-        const Gt = Math.max(0, s * fx.diveSide), se = Math.max(0, -fx.diveForward), re = (1 - walk) * (1 - dive) * (1 - slide), sn = 0.5 + 0.5 * motion;
-        const lx = (s * ((R ? 0.13 : 0.185) - 0.026 * walk - 0.027 * tt * sn + 0.048 * Mt + 0.03 * dive) + 0.043 * fx.diveSide) * nt + swayX * motion;
-        const ly = -0.188 + 0.036 * walk + 0.053 * tt * sn + tac * (0.021 + 0.022 * tt) - 0.037 * Mt + 0.027 * air + 0.048 * dive + 0.015 * s * re - 0.022 * Gt + fx.dip * 0.35 * motion + swayY * motion
-          + (0.005 * B + 0.003 * Math.sin(clock * 3.4 + s)) * breathe;
-        const lz = -0.377 - (0.08 + tac * 0.026) * tt * sn - 0.086 * Mt - 0.037 * air - 0.14 * dive - 0.072 * Gt + 0.105 * se + 0.014 * s * re + 0.005 * Math.sin(clock * 1.7 + s) * breathe;
-        locoQ.setFromEuler(_e.set((R ? 0.39 : 0.32) + 0.25 * tt - 0.43 * dive - 0.26 * Mt + breathe * 0.035 * B,
-          s * ((R ? 0.31 : 0.21) + 0.14 * walk + tac * 0.17 - 0.21 * dive) - 0.34 * fx.diveSide,
-          (R ? -0.035 : -0.65) + s * (0.12 * walk - 0.35 * dive - 0.31 * Mt + 0.15 * se) + breathe * 0.025 * Math.sin(clock * 1.1 + s), "XYZ"));
-        const ref = R ? IDLE : IDLE_L;
-        const anchor = _v3.set(s * (0.34 + 0.05 * dive) * nt, -0.32 - 0.035 * tt, -0.055 - 0.055 * dive);
-        if (R) {
-          // animation pose + locomotion offset (softened while inspecting, never cancelled)
-          const wl = 1 - 0.55 * busy;
-          baseQ.copy(ref.q).invert(); tmpQ.copy(locoQ).multiply(baseQ);
-          _q2.identity().slerp(tmpQ, wl);
-          const pos = _v2.set(handPos.x * nt + (lx - ref.p[0] * nt) * wl, handPos.y + (ly - ref.p[1]) * wl, handPos.z / lt + (lz - ref.p[2]) * wl);
-          const q = _q2.multiply(handQ);
-          clip.knife.sample(t + 0.01, kv2); const w = Math.abs(kv2[0] - kv[0]) * 100;   // deg/s
-          if (w > 150 && !inFlight) {
-            tug.set(-0.1181, -0.0082, 0).applyMatrix4(knife.matrix).sub(_v1.set(0, 0, 0).applyMatrix4(knife.matrix)).normalize();
-            pos.addScaledVector(tug, 0.0035 * Math.min(1, (w - 150) / 600));
-          }
-          applyAngles(hand, fa);
-          placeArm(hand, pos, q, anchor);
-        } else {
-          const away = Math.max(lv[0], st.clip && st.clip.kind === "equip" ? 1 - sstep(t, 0.25, 0.75) : 0);
-          const pos = _v2.set(lx, ly - 0.35 * away, lz);
-          const a = poseArray(POSES.relax), c = (0.2 - 0.3 * walk + 0.28 * dive + 0.16 * Mt + 0.1 * air) / DEG - 11;
-          for (let f = 0; f < 4; f++) a[f * 4 + 1] += c;
-          applyAngles(hand, a);
-          placeArm(hand, pos, locoQ, anchor);
-        }
+      // movement state weights, look rate and body acceleration (yaw-relative)
+      const k = 1 - Math.exp(-11 * dt), ground = P.grounded && P.state !== "surf";
+      const tw = { move: ground && !P.slide ? Math.min(1, sp / 6.2) : 0, sprint: +(P.state === "sprint"), tac: +(P.state === "tactical"), crouch: +(P.low && !P.slide && ground),
+        slide: +P.slide, dive: +P.diving, recover: +(P.recovery > 0 && !P.diving), air: +(!P.grounded && !P.diving && P.state !== "surf"), surf: +(P.state === "surf") };
+      for (const n in Wt) Wt[n] += (tw[n] - Wt[n]) * k;
+      const inv = 1 / Math.max(dt, 1 / 240), c = Math.cos(P.yaw), s_ = Math.sin(P.yaw);
+      const vR = P.vx * c - P.vz * s_, vF = -P.vx * s_ - P.vz * c;
+      if (!primed) { yaw0 = P.yaw; pitch0 = P.pitch; vF0 = vF; vR0 = vR; primed = !0; }
+      const kk = 1 - Math.exp(-12 * dt);
+      if (dt > 0) {
+        turnX += (Math.atan2(Math.sin(P.yaw - yaw0), Math.cos(P.yaw - yaw0)) * inv - turnX) * kk;
+        turnY += ((P.pitch - pitch0) * inv - turnY) * kk;
+        accF += (clamp((vF - vF0) * inv, -60, 60) - accF) * kk; accR += (clamp((vR - vR0) * inv, -60, 60) - accR) * kk;
+        // impulses: take-off, landing, footsteps, slide and dive starts
+        const m = motion;
+        if (wasGrounded && !P.grounded && P.vy > 1) for (const h of hands) kick(h, _v1.set(0, -0.3 * m, 0.05 * m), _v2.set(0.6 * m, 0, 0));
+        if (fx.landing > 0) for (const h of hands) kick(h, _v1.set(0, -0.85 * fx.landing * m, -0.08 * fx.landing * m), _v2.set(-1.4 * fx.landing * m, 0, 0));
+        if (fx.footfall > 0) for (const h of hands) kick(h, _v1.set(0, -(0.05 + 0.07 * Wt.sprint + 0.09 * Wt.tac) * fx.footfall * m, 0), null);
+        if (P.slide && !wasSlide) for (const h of hands) kick(h, _v1.set(0, 0.3 * m, -0.12 * m), null);
+        if (P.diving && !wasDive) for (const h of hands) kick(h, _v1.set(0, 0.15 * m, -0.35 * m), null);
       }
-      if (inFlight) { // free knife follows the hand's movement layer so the catch stays exact
+      yaw0 = P.yaw; pitch0 = P.pitch; vF0 = vF; vR0 = vR; wasGrounded = P.grounded; wasSlide = P.slide; wasDive = P.diving;
+      const nt = Math.min(1, aspect / 1.4), lt = Math.min(1, aspect / 1.3);
+
+      // right hand: clip pose + movement offset (softened while inspecting, never cancelled)
+      moveTarget(right, fx, motion, nt, busy, mp, mq);
+      const wl = 1 - 0.55 * busy;
+      dq.copy(IDLE.q).invert().premultiply(mq); _q2.identity().slerp(dq, wl);
+      right.tp.set(handPos.x * nt + (mp.x - IDLE.p[0] * nt) * wl, handPos.y + (mp.y - IDLE.p[1]) * wl, handPos.z / lt + (mp.z - IDLE.p[2]) * wl);
+      right.tq.copy(_q2).multiply(handQ);
+      // a spinning knife tugs the finger towards its centre of mass (centripetal pull)
+      if (st.clip && !inFlight) {
+        clip.knife.sample(t + 0.01, kv2); const om = Math.abs(kv2[0] - kv[0]) * 100 * DEG;
+        if (om > 3) right.tp.addScaledVector(tug.copy(COM_LOCAL).applyMatrix4(knife.matrix).sub(_v1.set(0, 0, 0).applyMatrix4(knife.matrix)).normalize(), Math.min(0.008, 0.00022 * om * om * 0.108));
+      }
+      applyAngles(right, fa);
+      follow(right, dt);
+      placeArm(right, right.sp, right.sq, anchor.set((0.34 + 0.05 * Wt.dive) * nt, -0.32, -0.055 - 0.055 * Wt.dive));
+
+      // left hand: movement only; drops out of view during inspections and rises with the draw
+      const away = Math.max(lv[0], st.clip && st.clip.kind === "equip" ? 1 - sstep(t, 0.25, 0.75) : 0);
+      moveTarget(left, fx, motion, nt, busy, mp, mq);
+      left.tp.copy(mp); left.tp.y -= 0.35 * away; left.tq.copy(mq);
+      const wf = Math.min(1, Wt.sprint + Wt.tac), wb = Math.min(1, Wt.slide + Wt.dive + Wt.recover), wa = Math.min(1, Wt.air + Wt.surf) * (1 - wb);
+      for (let j = 0; j < 21; j++) { let v = LF.relax[j]; v += (LF.fist[j] - v) * wf; v += (LF.air[j] - v) * wa; v += (LF.brace[j] - v) * wb; lf[j] = v; }
+      applyAngles(left, lf);
+      follow(left, dt);
+      placeArm(left, left.sp, left.sq, anchor.set(-(0.34 + 0.05 * Wt.dive) * nt, -0.32, -0.055 - 0.055 * Wt.dive));
+
+      if (inFlight) { // the free knife follows the hand's movement layer so the catch stays exact
         right.root.updateMatrixWorld(!0);
-        knife.matrix.multiplyMatrices(right.root.matrixWorld, kmat.compose(handPos, handQ, _v3.set(1, 1, 1)).invert()).multiply(freeMat);
+        knife.matrix.multiplyMatrices(right.root.matrixWorld, kmat.compose(handPos, handQ, ONE).invert()).multiply(freeMat);
       } else knife.matrix.copy(knifeWorld(kmat));
       knife.matrixWorldNeedsUpdate = !0;
+    }
+
+    function draw(renderer, camera) {
+      _q1.copy(camera.quaternion).invert();
+      key.position.copy(keyDir).applyQuaternion(_q1);
+      scene.environmentRotation.setFromQuaternion(_q1);
+      if (cam.aspect !== camera.aspect) { cam.aspect = camera.aspect; cam.updateProjectionMatrix(); }
       if (view) { // dev-only orbit camera around the right hand
         renderer.setClearColor(14211288, 1); renderer.clear(!0, !0, !0);
-        dbgCam.aspect = aspect; dbgCam.fov = view.fov || 30; dbgCam.updateProjectionMatrix();
+        dbgCam.aspect = camera.aspect; dbgCam.fov = view.fov || 30; dbgCam.updateProjectionMatrix();
         const tg = view.target ? _v1.fromArray(view.target) : _v1.copy(right.root.position).add(_v2.set(0.02, -0.03, -0.09).applyQuaternion(right.root.quaternion));
         dbgCam.position.set(tg.x + view.dist * Math.sin(view.yaw) * Math.cos(view.pitch), tg.y + view.dist * Math.sin(view.pitch), tg.z + view.dist * Math.cos(view.yaw) * Math.cos(view.pitch));
         dbgCam.lookAt(tg); left.root.visible = left.forearm.visible = left.cuff.visible = !view.hideLeft;
@@ -4884,7 +5074,13 @@ var KarambitVM = (() => {
       }
       renderer.clearDepth(); renderer.autoClear = !1; renderer.render(scene, cam); renderer.autoClear = !0;
     }
-    function reset(P) { yaw0 = P.yaw; pitch0 = P.pitch; swayX = swayY = walk = tac = slide = dive = air = 0; clock = 0; st.clip = CLIPS.equip; st.time = 0; st.queue = 0; st.still = 0; }
+    function render(renderer, P, fx, dt, camera, motion) { if (!held) update(P, fx, dt, motion, camera.aspect); draw(renderer, camera); }
+    function reset(P) {
+      for (const n in Wt) Wt[n] = 0;
+      turnX = turnY = accF = accR = 0; clock = 0; primed = !1; wasGrounded = !0; wasSlide = wasDive = !1;
+      for (const h of hands) h.fresh = !0;
+      st.clip = CLIPS.equip; st.time = 0; st.queue = 0; st.still = 0;
+    }
     function inspect() {
       if (!st.clip || (st.clip.kind === "fidget" && st.time < 0.2)) { st.queue = 0; st.clip = pickInspect(); st.time = 0; }
       else st.queue = Math.min(1, st.queue + 1);
@@ -4893,33 +5089,55 @@ var KarambitVM = (() => {
 
     /* ---------- debug hooks (only reachable from the dev build) ---------- */
     const debug = {
-      CLIPS, POSES, GRIP, SPECS, right, left, knife, cam, scene,
-      compile, solveGrip: (g) => { Object.assign(GRIP, g); solveGrip(); POSE_KEYS.forEach((k, i) => (POSES.grip[k] = gripPose.a.slice(i * 4, i * 4 + (k === "t" ? 5 : 4)))); for (const [n, s] of Object.entries(SPECS)) compile(n, s); return gripPose.a; },
+      CLIPS, POSES, GRIP, SPECS, right, left, knife, cam, scene, Wt, compile, spins: { s1, r1, r2, f2, HS, HT, HF, HE },
       play(name, t = 0, frozen = !0) { st.clip = CLIPS[name]; st.time = t; st.frozen = frozen; },
       freeze(v) { st.frozen = v; },
       view(v) { view = v; },
+      hold(v) { held = v; },
+      setMove(k, sd, v) { MOVE[k][sd] = v; prepMove(); },
       state: () => ({ clip: st.clip && st.clip.name, time: st.time }),
-      toss: (n) => { const t = CLIPS[n].toss; return t && { v0: t.v0.toArray(), axis: t.axis.toArray(), g: t.g.length(), spin: t.spin }; },
-      // sample a clip and report knife/hand penetration and joint/wrist limits
+      toss: (n) => { const t = CLIPS[n].toss; return t && { t0: t.t0, t1: t.t1, v0: t.v0.toArray(), axis: t.axis.toArray(), g: t.g.toArray(), spin: t.spin, dp: t.dp.toArray() }; },
+      // drive the hands with a scripted player state (fixed 120 Hz steps), then hold the result for screenshots
+      advance(sec, o = {}) {
+        const P = { x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0, yaw: 0, pitch: 0, grounded: !0, state: "ready", slide: !1, diving: !1, recovery: 0, low: !1, ...o.P };
+        const fx = { phase: 0.5, dip: 0, slideSide: 1, diveSide: 0, diveForward: 0, landing: 0, footfall: 0, ...o.fx };
+        const dt = 1 / 120, ev = (o.events || []).slice(), trace = [];
+        if (o.clip) { st.clip = CLIPS[o.clip]; st.time = o.clipTime || 0; st.frozen = !1; } else st.frozen = !0;
+        for (let i = 0, n = Math.round(sec / dt); i < n; i++) {
+          const t = i * dt;
+          while (ev.length && ev[0].t <= t) { const e = ev.shift(); Object.assign(P, e.P || {}); Object.assign(fx, e.fx || {}); }
+          const speed = Math.hypot(P.vx, P.vz), prev = fx.phase;
+          if (P.grounded && !P.slide) fx.phase = (fx.phase + speed * dt / (1.08 + Math.min(speed, 12) * 0.19)) % 2;
+          fx.footfall = P.grounded && !P.slide && Math.floor(prev) !== Math.floor(fx.phase) ? clamp(speed / 10, 0.1, 1) : 0;
+          if (o.yawRate) P.yaw += o.yawRate * dt;
+          update(P, fx, dt, o.motion ?? 1, o.aspect ?? 16 / 9);
+          fx.landing = 0;
+          if (o.trace) trace.push([+t.toFixed(3), ...right.sp.toArray().map((x) => +x.toFixed(4)), ...left.sp.toArray().map((x) => +x.toFixed(4)),
+            +(right.sp.distanceTo(right.tp) * 1000).toFixed(2), +(2 * Math.acos(Math.min(1, Math.abs(right.sq.dot(right.tq)))) / DEG).toFixed(2)]);
+        }
+        held = !0; return o.trace ? trace : { right: right.sp.toArray(), left: left.sp.toArray(), Wt: { ...Wt } };
+      },
+      // sample a clip and report knife/hand penetration, invalid values and hand self-collisions
       check(name, step = 1 / 120) {
         const clip = CLIPS[name], rows = []; let worst = { depth: -1 };
         for (let t = 0; t <= clip.dur + 1e-9; t += step) {
-          evalClip(clip, t); applyAngles(right, fa);
+          evalClip(clip, t);
+          if ([...fa, ...kv, handPos.x, handPos.y, handPos.z, handQ.w].some((x) => !Number.isFinite(x))) { worst = { depth: 9, tag: "NaN", part: "", t }; rows.push([+t.toFixed(3), 9000, "NaN", ""]); continue; }
+          applyAngles(right, fa);
           right.root.position.copy(handPos); right.root.quaternion.copy(handQ); right.root.updateMatrixWorld(!0);
           const km = new Mat4().copy(right.root.matrixWorld).invert().multiply(inFlight ? freeMat : knifeWorld(new Mat4()));
           const r = knifeContacts(right, km);
-          // hand self-collisions: thumb vs fingers, neighbouring fingers, fingertips vs palm
           for (let a = 0; a < caps.length; a++) {
             const A = caps[a], fa_ = A.tag[0] === "f" ? +A.tag[1] : 9, sa = +A.tag[2];
             for (let u = 0; u <= 4; u++) {
-              const P = _v2.copy(A.a).lerp(A.b, u / 4), ra = lerp(A.r0, A.r1, u / 4);
-              if (A.tag !== "t0" && (sa > 0 || u >= 3)) { const d = palmDepth(P.x, P.y, P.z) + 0.75 * ra - 0.002; if (d > r.worst.depth) r.worst = { depth: d, tag: A.tag + "~palm", part: "self" }; }
+              const Pp = _v2.copy(A.a).lerp(A.b, u / 4), ra = lerp(A.r0, A.r1, u / 4);
+              if (A.tag !== "t0" && (sa > 0 || u >= 3)) { const d = palmDepth(Pp.x, Pp.y, Pp.z) + 0.75 * ra - 0.002; if (d > r.worst.depth) r.worst = { depth: d, tag: A.tag + "~palm", part: "self" }; }
               for (let b = 0; b < caps.length; b++) {
-                const B = caps[b], fb_ = B.tag[0] === "f" ? +B.tag[1] : 9;
-                if (fa_ === fb_ || (A.tag[0] === "f" && B.tag[0] === "f" && Math.abs(fa_ - fb_) !== 1) || b < a && B.tag[0] === A.tag[0]) continue;
-                if (sa === 0 && +B.tag[2] === 0 && u < 2) continue; // knuckles sit side by side inside the glove
-                const d = capsuleDepth(B, P) + ra * 0.85 - 0.0015;
-                if (d > r.worst.depth) r.worst = { depth: d, tag: A.tag + "~" + B.tag, part: "self" };
+                const Bc = caps[b], fb_ = Bc.tag[0] === "f" ? +Bc.tag[1] : 9;
+                if (fa_ === fb_ || (A.tag[0] === "f" && Bc.tag[0] === "f" && Math.abs(fa_ - fb_) !== 1) || (b < a && Bc.tag[0] === A.tag[0])) continue;
+                if (sa === 0 && +Bc.tag[2] === 0 && u < 2) continue; // knuckles sit side by side inside the glove
+                const d = capsuleDepth(Bc, Pp) + ra * 0.85 - 0.0015;
+                if (d > r.worst.depth) r.worst = { depth: d, tag: A.tag + "~" + Bc.tag, part: "self" };
               }
             }
           }
@@ -4930,6 +5148,17 @@ var KarambitVM = (() => {
       },
       contactsNow() { right.root.updateMatrixWorld(!0); const km = new Mat4().copy(right.root.matrixWorld).invert().multiply(knife.matrix); const r = knifeContacts(right, km); return { worst: r.worst, per: Object.fromEntries(Object.entries(r.per).map(([k, v]) => [k, +(v * 1000).toFixed(2)])) }; },
       wrist: () => hands.map((h) => [+h.wristFlex.toFixed(1), +h.wristDev.toFixed(1), +h.roll.toFixed(1)]),
+      // smallest gap (mm) between the left hand and the right hand / knife, in camera space
+      handsGap() {
+        const cam = (h) => { h.root.updateMatrixWorld(!0); return handCapsules(h, []).map((c) => ({ ...c, a: c.a.clone().applyMatrix4(h.root.matrixWorld), b: c.b.clone().applyMatrix4(h.root.matrixWorld) })); };
+        const L = cam(left), Rr = cam(right); let gap = 1, what = "";
+        for (const A of L) for (let u = 0; u <= 4; u++) {
+          const Pp = A.a.clone().lerp(A.b, u / 4), ra = lerp(A.r0, A.r1, u / 4);
+          for (const B of Rr) { const g = -capsuleDepth(B, Pp) - ra; if (g < gap) { gap = g; what = A.tag + "~R" + B.tag; } }
+          for (let k = 0; k < kPts.length; k += 4) { const g = _v1.copy(kPts[k]).divideScalar(KNIFE_SCALE).applyMatrix4(knife.matrix).distanceTo(Pp) - ra; if (g < gap) { gap = g; what = A.tag + "~knife:" + kTag[k]; } }
+        }
+        return { gapMM: +(gap * 1000).toFixed(1), what };
+      },
     };
     return { reset, render, inspect, setQuality, debug };
   };
