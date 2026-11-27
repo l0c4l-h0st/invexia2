@@ -5102,7 +5102,7 @@ var KarambitVM = (() => {
         const P = { x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0, yaw: 0, pitch: 0, grounded: !0, state: "ready", slide: !1, diving: !1, recovery: 0, low: !1, ...o.P };
         const fx = { phase: 0.5, dip: 0, slideSide: 1, diveSide: 0, diveForward: 0, landing: 0, footfall: 0, ...o.fx };
         const dt = 1 / 120, ev = (o.events || []).slice(), trace = [];
-        if (o.clip) { st.clip = CLIPS[o.clip]; st.time = o.clipTime || 0; st.frozen = !1; } else st.frozen = !0;
+        if (o.clip) { st.clip = CLIPS[o.clip]; st.time = o.clipTime || 0; st.frozen = !1; } else { st.clip = null; st.time = 0; st.frozen = !0; }
         for (let i = 0, n = Math.round(sec / dt); i < n; i++) {
           const t = i * dt;
           while (ev.length && ev[0].t <= t) { const e = ev.shift(); Object.assign(P, e.P || {}); Object.assign(fx, e.fx || {}); }
