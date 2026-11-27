@@ -40,7 +40,7 @@
         <div><kbd>C</kbd><span>Glisser / s’accroupir</span></div>
         <div><kbd>V</kbd><span>Plonger en sprint</span></div>
         <div><kbd>Espace</kbd><span>Sauter · maintenir pour enchaîner</span></div>
-        <div><kbd>F</kbd><span>Inspecter · 4 figures en boucle, un appui prépare la suivante</span></div>
+        <div><kbd>F</kbd><span>Inspecter · 7 figures en boucle, un appui prépare la suivante</span></div>
         <div><kbd>Ctrl</kbd><span>Freiner / marcher</span></div>
         <div><kbd>R</kbd><span>Revenir au départ</span></div>
       </div>
@@ -4199,6 +4199,10 @@ void main() {
      the finger (slow at the top, fast at the bottom, braked into a pendulum
      catch); the rare inspection throws the knife in a ballistic flight around
      its centre of mass and catches it back on the finger.
+   - F cycles through seven figures: faces and spin, triple spin (wrist pumps,
+     then the blade is shown), medallion, yo-yo (a turn forward, a full turn
+     back, forward again into the catch), figure eight, sweep (four spins
+     while the hand crosses the view) and the toss.
    - Both hands follow their targets through damped springs, so landings,
      steps, flicks and catches ring out; movement poses (stride, sprint,
      tactical sprint, slide, dive, air, surf) blend by state.
@@ -5471,6 +5475,51 @@ var KarambitVM = (() => {
       return o.extra ? run(D, (t) => o.extra(t, first.end)) : first;
     }
 
+    // driven spins: small hand circles keep the knife turning (constant drive) until `driveUntil`, then the hand brakes into a catch
+    function spinDriven(o) {
+      const run = (c, extra) => simulateSpin({ ...o, extra, torque: (phi, w) => (phi > o.driveUntil ? -o.drive : 0) - (phi < o.brakeFrom ? c : o.damp) * w, stop: swingBack(o.bottom) });
+      const c = bisect((c) => o.overshoot + (run(c).phiMin - o.bottom) / DEG, 0, 80);
+      const first = run(c);
+      return o.extra ? run(c, (t) => o.extra(t, first.end)) : first;
+    }
+    // yo-yo: forward turn braked to a stall short of the top; the hand pumps it back a full turn the other way and
+    // stalls it again just past the bottom; a second flick sends it forward over the top into the usual pendulum catch.
+    // Every phase keeps the spin set-up (fist closed, ring out at the fingertip), so the path stays clear of the fingers.
+    function spinYoyo(o) {
+      const sim = (c1, c2, c3, upto, extra) => {
+        let ph = 0, top = -Infinity;
+        return simulateSpin({ ...o, extra,
+          torque: (phi, w) => {
+            if (ph === 0 && w > 0) ph = 1; else if (ph === 1 && w < 0) ph = 2;
+            if (ph === 0) return -(phi < o.brake1 ? c1 : o.damp) * w;
+            if (ph === 1) { top = Math.max(top, phi); return (phi < o.pumpUntil ? o.pump : 0) - (phi > o.brake2 ? c2 : o.damp) * w; }
+            return (phi > o.drive3Until ? -o.pump3 : 0) - (phi < o.brake3 ? c3 : o.damp) * w;
+          },
+          stop: () => { const sb = swingBack(o.bottom)(); return (phi, w) => (upto === 0 ? ph >= 1 : upto === 1 ? ph >= 2 : ph === 2 && sb(phi, w)); } });
+      };
+      const c1 = bisect((c) => (sim(c, 0, 0, 0).phiMin - o.stall1) / DEG, 0, 80, 30);
+      // the second stall: highest angle reached on the way back (more brake → lower)
+      const peak = (c2) => { const r = sim(c1, c2, 0, 1); let m = -Infinity; for (const k of r.keys) if (k.t > o.t + 0.3) m = Math.max(m, (k.theta - o.hang) * DEG); return m; };
+      const c2 = bisect((c) => o.stall2 - peak(c), 0, 80, 30);
+      const run = (c3, extra) => sim(c1, c2, c3, 2, extra);
+      const lowAfterStalls = (r) => { // lowest angle of the last phase (after the second stall)
+        let n = 0, m = Infinity;
+        for (let i = 1; i < r.keys.length; i++) { const a = r.keys[i - 1], k = r.keys[i]; if (Math.sign(a.thetaVel) !== Math.sign(k.thetaVel)) n++; if (n >= 2) m = Math.min(m, (k.theta - o.hang) * DEG); }
+        return m;
+      };
+      const c3 = bisect((c) => { const r = run(c); return r.done ? o.overshoot + (lowAfterStalls(r) - o.bottom) / DEG : 1; }, 0, 40, 30);
+      const first = run(c3);
+      const res = o.extra ? run(c3, (t) => o.extra(t, first.end)) : first;
+      res.stalls = res.keys.filter((k, i, a) => i && Math.sign(a[i - 1].thetaVel) !== Math.sign(k.thetaVel)).map((k) => k.t);
+      return res;
+    }
+    // times at which a spin passes the bottom (every full turn from the hang angle)
+    const passTimes = (keys, hang, sign = -1) => {
+      const out = [];
+      for (let i = 1; i < keys.length; i++) if (Math.floor(sign * (keys[i - 1].theta - hang) / 360) !== Math.floor(sign * (keys[i].theta - hang) / 360)) out.push(keys[i].t);
+      return out;
+    };
+
     /* ---------- clip library ----------
        Times in seconds, angles in degrees, positions in metres (camera space, 16:9).
        hand: "idle" | {p, f: finger direction, b: back-of-hand direction} | {p, e: Euler XYZ}
@@ -5536,6 +5585,24 @@ var KarambitVM = (() => {
     const f2 = spinToCatch({ t: 0.45, hang: HF.hang, mg: HF.mg, theta: HF.hang, omega: -1010, damp: 0.5, bottom: -TAU, brakeFrom: -1.2 * Math.PI, overshoot: 20,
       extra: (t, end) => ({ slide: 40, ecc: eccAt(t, 0.45, end) }) });
     const HE = hangOf(EQ_HAND, "spin");
+
+    /* ---------- tricks ---------- */
+    // triple: three spins kept alive by small wrist pumps, faster each turn, braked into the catch, then the blade is shown
+    // trick hand: index pointing forward-left so the knife's circle faces the camera, clear of the fist
+    const SPIN2_HAND = { p: [0.07, -0.105, -0.365], f: [-0.5, 0.33, -0.8], b: [0.06, 0.95, 0.3] }, H2 = hangOf(SPIN2_HAND, "spin");
+    const s3 = spinDriven({ t: 0.62, hang: H2.hang, mg: H2.mg, theta: H2.hang, omega: -880, damp: 0.45, drive: 15, driveUntil: -4.4 * Math.PI, bottom: -6 * Math.PI, brakeFrom: -5.2 * Math.PI, overshoot: 22,
+      extra: (t, end) => ({ slide: 40, ecc: eccAt(t, 0.62, end) }) });
+    const s3pumps = passTimes(s3.keys, H2.hang).slice(0, 2);
+    // yo-yo: one turn forward, stall short of the top, a full turn back, stall just past the bottom, then forward into the catch
+    const y1 = spinYoyo({ t: 0.62, hang: H2.hang, mg: H2.mg, theta: H2.hang, omega: -960, damp: 0.45, brake1: -2.15 * Math.PI, stall1: -2.8 * Math.PI,
+      pump: 11, pumpUntil: -0.3 * Math.PI, brake2: -0.15 * Math.PI, stall2: 0.3 * Math.PI, pump3: 40, drive3Until: -0.95 * Math.PI,
+      bottom: -2 * Math.PI, brake3: -1.25 * Math.PI, overshoot: 22, extra: (t, end) => ({ slide: 40, ecc: eccAt(t, 0.62, end) }) });
+    // sweep: the hand travels across the view while the knife keeps spinning, and catches it on the far side
+    const SWEEP_A = { ...SPIN2_HAND, p: [0.112, -0.125, -0.38] }, SWEEP_B = { ...SPIN2_HAND, p: [0.0, -0.08, -0.395] };
+    const w1 = spinDriven({ t: 0.6, hang: H2.hang, mg: H2.mg, theta: H2.hang, omega: -920, damp: 0.45, drive: 13, driveUntil: -5.6 * Math.PI, bottom: -8 * Math.PI, brakeFrom: -7.2 * Math.PI, overshoot: 24,
+      extra: (t, end) => ({ slide: 40, ecc: eccAt(t, 0.6, end) }) });
+    const w1pumps = passTimes(w1.keys, H2.hang).slice(0, 3);
+    const sweepAt = (u) => ({ ...SPIN2_HAND, p: SWEEP_A.p.map((a, i) => lerp(a, SWEEP_B.p[i], u) + (i === 1 ? 0.03 * Math.sin(Math.PI * u) : 0)) });
 
     const SPECS = {
       idle: { dur: 1, kind: "idle", keys: [{ t: 0, hand: "idle", fingers: "grip", theta: G, left: 0 }, { t: 1, hand: "idle", fingers: "grip", theta: G, left: 0 }] },
@@ -5618,6 +5685,64 @@ var KarambitVM = (() => {
         { t: r2.end + 0.35, left: 1 },
         { t: r2.end + 0.86, hand: "idle", fingers: "grip", theta: G - 1440, left: 0 },
       ] },
+      // triple spin with wrist pumps, caught, then a roll of the wrist to show the blade
+      inspectTriple: { dur: s3.end + 1.5, kind: "inspect", keys: [
+        { t: 0, hand: "idle", fingers: "grip", theta: G, slide: 31, ecc: ECC, left: 0 },
+        { t: 0.13, hand: { p: [0.134, -0.182, -0.358], e: [0.47, 0.35, -0.09] } },
+        { t: 0.24, left: 1 },
+        { t: 0.3, hand: twist(SPIN2_HAND, -10, [0.004, -0.008, 0.004]) },
+        ...release(0.37, SPIN2_HAND, H2.hang),
+        { t: 0.62, kick: flick(SPIN2_HAND, 2.4) },
+        { t: 0.76, fingers: "spin" },
+        ...s3.keys,
+        ...s3pumps.flatMap((tp, i) => [{ t: tp - 0.06, kick: flick(SPIN2_HAND, 1.5 + 0.3 * i), sfx: ["flick", 0.45] }]),
+        { t: (0.62 + s3.end) / 2, hand: { ...SPIN2_HAND, p: [0.078, -0.098, -0.374] } },          // the hand climbs a little as the spin speeds up
+        { t: s3.end - 0.2, fingers: "spin", hand: SPIN2_HAND },
+        ...regrip(s3.end, H2.hang - 1080, G - 1080, SPIN2_HAND),
+        { t: s3.end + 0.5, hand: twist(FACE_B, 8, [0.006, 0.006, 0]), sfx: ["creak", 0.4] },     // flourish: show the blade
+        { t: s3.end + 0.95, hand: FACE_B2 },
+        { t: s3.end + 1.05, left: 0.8 },
+        { t: s3.end + 1.5, hand: "idle", fingers: "grip", theta: G - 1080, left: 0 },
+      ] },
+      // yo-yo: the spin stalls near the top, runs a full turn backwards, stalls again and goes forward into the catch
+      inspectYoyo: { dur: y1.end + 0.9, kind: "inspect", keys: [
+        { t: 0, hand: "idle", fingers: "grip", theta: G, slide: 31, ecc: ECC, left: 0 },
+        { t: 0.13, hand: { p: [0.132, -0.18, -0.36], e: [0.45, 0.34, -0.1] } },
+        { t: 0.24, left: 1 },
+        { t: 0.3, hand: twist(SPIN2_HAND, -12, [0.004, -0.006, 0.004]) },
+        ...release(0.37, SPIN2_HAND, H2.hang),
+        { t: 0.62, kick: flick(SPIN2_HAND, 2.6) },
+        { t: 0.76, fingers: "spin" },
+        ...y1.keys,
+        // at each stall the hand sinks as the knife climbs, then snaps the other way
+        ...y1.stalls.slice(0, 2).flatMap((ts, i) => [
+          { t: ts - 0.16, hand: { ...SPIN2_HAND, p: [0.07, -0.118 + 0.004 * i, -0.368] } },
+          { t: ts, sfx: ["scrape", 0.45] },
+          { t: ts + 0.02, kick: flick(SPIN2_HAND, i ? 2.4 : -2.2), sfx: ["flick", 0.6] },
+          { t: ts + 0.13, hand: { ...SPIN2_HAND, p: [0.068, -0.1, -0.364] } },
+        ]),
+        { t: y1.end - 0.2, fingers: "spin", hand: SPIN2_HAND },
+        ...regrip(y1.end, H2.hang - 360, G - 360),
+        { t: y1.end + 0.36, left: 0.9 },
+        { t: y1.end + 0.9, hand: "idle", fingers: "grip", theta: G - 360, left: 0 },
+      ] },
+      // sweep: four spins while the hand travels across the view, caught on the far side
+      inspectSweep: { dur: w1.end + 0.95, kind: "inspect", keys: [
+        { t: 0, hand: "idle", fingers: "grip", theta: G, slide: 31, ecc: ECC, left: 0 },
+        { t: 0.13, hand: { p: [0.136, -0.184, -0.358], e: [0.47, 0.36, -0.08] } },
+        { t: 0.24, left: 1 },
+        { t: 0.3, hand: twist(SWEEP_A, -10, [0.003, -0.006, 0.004]) },
+        ...release(0.36, SWEEP_A, H2.hang),
+        { t: 0.6, kick: flick(SWEEP_A, 2.4) },
+        { t: 0.74, fingers: "spin" },
+        ...w1.keys,
+        ...w1pumps.map((tp, i) => ({ t: tp - 0.06, kick: flick(SPIN2_HAND, 1.4 + 0.2 * i), sfx: ["flick", 0.4] })),
+        ...[0.25, 0.5, 0.75, 1].map((u) => ({ t: lerp(0.72, w1.end - 0.25, u), hand: sweepAt(u) })),
+        { t: w1.end - 0.2, fingers: "spin" },
+        ...regrip(w1.end, H2.hang - 1440, G - 1440, SWEEP_B),
+        { t: w1.end + 0.38, left: 0.85 },
+        { t: w1.end + 0.95, hand: "idle", fingers: "grip", theta: G - 1440, left: 0 },
+      ] },
       // draw: the knife arrives spinning on the index and is caught into the grip
       equip: { dur: 0.98, kind: "equip", keys: [
         { t: 0, hand: { p: [0.17, -0.34, -0.36], f: [-0.3, 0.55, -0.78], b: [0.25, 0.8, 0.5] }, fingers: "spin", theta: HE.hang + 30, slide: 40, ecc: [1, 0], left: 0 },
@@ -5655,7 +5780,7 @@ var KarambitVM = (() => {
     const st = { clip: CLIPS.equip, time: 0, queue: 0, still: 0, fidgetIn: 3, nextInspect: 0, frozen: !1 };
     const dbgCam = new Ue(30, 1, 0.005, 5); let view = null, held = !1;
 
-    const inspectionOrder = [CLIPS.inspect, CLIPS.inspectMedallion, CLIPS.inspectRibbon, CLIPS.inspectRare];
+    const inspectionOrder = [CLIPS.inspect, CLIPS.inspectTriple, CLIPS.inspectMedallion, CLIPS.inspectYoyo, CLIPS.inspectRibbon, CLIPS.inspectSweep, CLIPS.inspectRare];
     function pickInspect() {
       const clip = inspectionOrder[st.nextInspect];
       st.nextInspect = (st.nextInspect + 1) % inspectionOrder.length;
@@ -5910,7 +6035,7 @@ var KarambitVM = (() => {
 
     /* ---------- debug hooks (only reachable from the dev build) ---------- */
     const debug = {
-      CLIPS, POSES, GRIP, SPECS, right, left, knife, cam, scene, Wt, compile, spins: { s1, r1, r2, f2, HS, HT, HF, HE },
+      CLIPS, POSES, GRIP, SPECS, right, left, knife, cam, scene, Wt, compile, spins: { s1, r1, r2, f2, HS, HT, HF, HE, H2, s3, y1, w1, s3pumps, w1pumps },
       play(name, t = 0, frozen = !0) { st.clip = CLIPS[name]; st.time = t; st.frozen = frozen; },
       freeze(v) { st.frozen = v; },
       view(v) { view = v; },
