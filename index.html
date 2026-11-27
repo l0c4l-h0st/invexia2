@@ -4209,6 +4209,11 @@ void main() {
    - Lighting: the viewmodel takes the world's sun and sky (HDR environment,
      rim light, soft self-shadows); VelocityLighting below gives the world
      sun shadows that follow the player.
+   - Look of the hands: one continuous skin per digit that bends over the
+     bones (knuckles push out, wrinkles and creases painted in), real nails,
+     fingerless gloves with knit backs, pebbled leather, a moulded knuckle
+     guard, rolled finger hems, a velcro wrist strap, folds that deepen as the
+     fingers close, and a softshell jacket sleeve with seams and drapes.
    Interface used by the game: { reset(player), render(renderer, player, cameraFx,
    dt, camera, motionScale), inspect(), setQuality({effects}) }.
    The three.js classes below are the bundle's minified names.
@@ -4326,47 +4331,524 @@ var KarambitVM = (() => {
     }
   }
 
-  /* ---------------- geometry helpers (bundle: bi tube, Zr merger, $r stitches, Jr pads) ---------------- */
-  function capsule(len, w0, h0, w1, h1, tip) {
-    const p = [[0, 0, 0.92 * h0, 0.3 * w0, 0.3 * h0], [0, 0, 0.55 * h0, 0.84 * w0, 0.84 * h0], [0, 0, 0, w0, h0],
-      [0, 0, -0.5 * len, (w0 + w1) / 2, (h0 + h1) / 2], [0, 0, -len, w1, h1]];
-    if (tip) p.push([0, 0, -len - 0.42 * h1, 0.86 * w1, 0.84 * h1], [0, 0, -len - 0.78 * h1, 0.56 * w1, 0.52 * h1], [0, 0, -len - 0.98 * h1, 0.14 * w1, 0.16 * h1]);
-    else p.push([0, 0, -len - 0.55 * h1, 0.84 * w1, 0.84 * h1], [0, 0, -len - 0.92 * h1, 0.3 * w1, 0.3 * h1]);
-    return p;
+  /* ======================================================================
+     Realistic hands: one continuous skin per digit, nails, glove materials
+     and a softshell jacket sleeve.
+     - Each digit is a tube of rings. Every ring follows the bones of its
+       digit and blends between two bones across a joint, so the skin bends
+       smoothly instead of showing one piece per phalanx. Knuckles push out
+       as a joint closes; the palm side bunches.
+     - The glove's finger sleeves deform the same way and fold on the palm
+       side as the fingers close.
+     - Textures (skin atlas, knit, pebbled leather, moulded rubber, ribbing,
+       softshell) are painted at load time; nothing is downloaded.
+     ====================================================================== */
+  const SKIN_SEG = 16, GLOVE_SEG = 18, SE_P = 2 / 2.3;
+  const sePt = (c, s) => [Math.sign(c) * Math.pow(Math.abs(c), SE_P), Math.sign(s) * Math.pow(Math.abs(s), SE_P)];
+  const gauss = (x, s) => Math.exp(-(x / s) * (x / s));
+  const lin = (c) => Math.pow(c / 255, 2.2); // sRGB byte → linear (vertex colours are linear)
+  const hmix = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+
+  // digit shape (millimetres, digit frame: -Z along the digit, +Y dorsal). Shared by both hands.
+  function digitShape(def, thumb) {
+    const [L0, L1, L2] = def.len, h = def.h, a = (def.w + def.h) / 2, Ls = [L0, L1, L2];
+    const J = [0, L0, L0 + L1];
+    const R = thumb ? [[1.1 * a, 1.02 * a], [0.95 * a, 0.9 * a], [0.87 * a, 0.8 * a]] : [[1.0 * a, 0.96 * a], [0.89 * a, 0.84 * a], [0.8 * a, 0.75 * a]];
+    const segR = (s) => { const k = s < J[1] ? 0 : s < J[2] ? 1 : 2, t = clamp((s - J[k]) / Ls[k], 0, 1); return lerp(R[k][0], R[k][1], t); };
+    const rBase = (s) => 0.25 * segR(s - 2.5) + 0.5 * segR(s) + 0.25 * segR(s + 2.5) + 0.03 * a * (gauss(s - J[1], 3.5) + gauss(s - J[2], 3.2));
+    const sEnd = J[2] + L2 + 0.6 * h, sC = sEnd - 0.85 * rBase(sEnd - 5.5), sHem = thumb ? L0 + 0.32 * L1 : 0.6 * L0;
+    const pad = (s) => (s > J[1] && s < J[2] ? 0.045 * a * Math.pow(Math.sin(Math.PI * (s - J[1]) / L1), 1.5) : 0)
+      + (s > J[2] ? 0.09 * a * Math.pow(Math.sin(Math.PI * (0.1 + 0.8 * clamp((s - J[2]) / (sEnd - J[2]), 0, 1))), 1.2) : 0)
+      - 0.04 * a * (gauss(s - J[1], 1.1) + gauss(s - J[2], 1.1));
+    function tipK(s) {
+      if (s <= sC) return [1, 1, 1];
+      const t = Math.min(1, (s - sC) / (sEnd - sC));
+      return [Math.pow(1 - Math.pow(t, 2.4), 1 / 2.4), Math.pow(1 - t * t * t * t, 0.25), Math.sqrt(Math.max(0, 1 - t * t))];
+    }
+    function axes(s) { // half-axes of the skin at s: [rx, ry dorsal, ry palmar]
+      const r = rBase(Math.min(s, sC)), [kx, kd, kp] = tipK(s);
+      return [1.05 * r * kx, 0.9 * r * kd, (0.96 * r + pad(s)) * kp];
+    }
+    function skin(s, th) {
+      const [rx, ryD, ryP] = axes(s), [px, py] = sePt(Math.cos(th), Math.sin(th));
+      return [rx * px, (py > 0 ? ryD : ryP) * py];
+    }
+    function glove(s, th, close) {
+      if (close) { const [rx, ryD, ryP] = axes(s), [px, py] = sePt(Math.cos(th), Math.sin(th)); return [(rx - 0.15) * px, ((py > 0 ? ryD : ryP) - 0.15) * py]; }
+      const r = rBase(Math.max(s, 0)) + 1.05 + (thumb ? 0 : 1.1 * sstep(-s, 3, 14)) + 0.8 * sstep(s, sHem - 2.8, sHem - 0.5);
+      const [px, py] = sePt(Math.cos(th), Math.sin(th));
+      return [1.05 * r * px, (py > 0 ? 0.93 : 0.95) * r * py];
+    }
+    const B = [thumb ? 10 : 8, 0.62 * R[1][0], 0.6 * R[2][0]];
+    function blend(s) { // bones: 0 base, 1 proximal, 2 middle, 3 distal; returns [ia, ib, w]
+      for (let j = 0; j < 3; j++) { if (s < J[j] - B[j]) return [j, j, 0]; if (s < J[j] + B[j]) return [j, j + 1, sstep(s, J[j] - B[j], J[j] + B[j])]; }
+      return [3, 3, 0];
+    }
+    const s0 = sHem - 4, nailBase = J[2] + (thumb ? 0.34 : 0.4) * L2, nailEnd = sC + 0.78 * (sEnd - sC);
+    return { thumb, a, h, J, Ls, R, B, rBase, axes, skin, glove, blend, sEnd, sC, sHem, s0, nailBase, nailEnd, start: [0, 0, L0, L0 + L1] };
   }
-  function skinUV(geo, v0, v1) {
-    const pos = geo.attributes.position, uv = geo.attributes.uv;
-    let z0 = -Infinity, z1 = Infinity;
-    for (let i = 0; i < pos.count; i++) { z0 = Math.max(z0, pos.getZ(i)); z1 = Math.min(z1, pos.getZ(i)); }
-    for (let i = 0; i < pos.count; i++) uv.setXY(i, (i % ($i + 1)) / $i - 0.25, v0 + (v1 - v0) * (z0 - pos.getZ(i)) / (z0 - z1));
-    return geo;
+  const SHAPES = [...FINGERS.map((d) => digitShape(d, !1)), digitShape(THUMB, !0)];
+
+  function ringList(from, to, coarse, fine, zones) { // s samples, finer near the given [centre, half-width] zones
+    const out = []; let s = from;
+    while (s < to - 1e-6) { out.push(s); const f = zones.some(([c, w]) => Math.abs(s - c) < w); s += f ? fine : coarse; }
+    out.push(to); return out;
   }
 
+  /* A tube whose rings ride the digit's bones (CPU-skinned every frame). */
+  class RingTube {
+    constructor(S, sList, seg, side, profile, uvOf, { closeLast = !1, tip = !1, fold = null } = {}) {
+      const n = sList.length, m = seg + 1, N = n * m;
+      this.n = n; this.m = m; this.side = side;
+      const pos = new Float32Array(N * 3), uv = new Float32Array(N * 2), idx = [];
+      this.lx = new Float32Array(N); this.ly = new Float32Array(N); this.ex = new Float32Array(N); this.ey = new Float32Array(N);
+      this.md = new Float32Array(N); this.mp = new Float32Array(N);
+      this.rings = sList.map((s, i) => {
+        const [ia, ib, w] = S.blend(s), last = closeLast && i === n - 1;
+        const jg = [];
+        for (let j = 0; j < 3; j++) { const sg = j === 0 ? 7 : 0.58 * S.R[j][0], d = s - S.J[j], g = gauss(d, sg); if (g > 0.01) jg.push({ j, g, dg: -2 * d / (sg * sg) * g }); }
+        return { s, ia, ib, w, za: -(s - S.start[ia]), zb: -(s - S.start[ib]), jg, fw: fold ? gauss(s - fold.at, fold.width) : 0 };
+      });
+      for (let i = 0; i < n; i++) for (let j = 0; j < m; j++) {
+        const th = TAU * j / seg, k = i * m + j, s = sList[i], [x, y] = profile(s, th, closeLast && i === n - 1);
+        pos[k * 3] = side * x; pos[k * 3 + 1] = y; pos[k * 3 + 2] = -s;
+        this.lx[k] = side * x; this.ly[k] = y;
+        const sn = Math.sin(th); this.md[k] = sn > 0 ? sn * sn : 0; this.mp[k] = sn < 0 ? sn * sn : 0;
+        const [u, v] = uvOf(s, th); uv[k * 2] = u; uv[k * 2 + 1] = v;
+      }
+      for (let i = 0; i < n - 1; i++) for (let j = 0; j < seg; j++) {
+        const a = i * m + j, b = a + 1, c = a + m, d = c + 1;
+        if (side > 0) idx.push(a, c, b, b, c, d); else idx.push(a, b, c, b, d, c);
+      }
+      const geo = new de();
+      geo.setAttribute("position", new $t(pos, 3)); geo.setAttribute("uv", new $t(uv, 2)); geo.setIndex(idx);
+      geo.computeVertexNormals();
+      const nor = geo.attributes.normal;
+      for (let i = 0; i < n; i++) { // close the seam
+        const a = i * m, b = a + seg; _v1.fromBufferAttribute(nor, a).add(_v2.fromBufferAttribute(nor, b)).normalize();
+        nor.setXYZ(a, _v1.x, _v1.y, _v1.z); nor.setXYZ(b, _v1.x, _v1.y, _v1.z);
+      }
+      if (tip) for (let j = 0; j < m; j++) nor.setXYZ((n - 1) * m + j, 0, 0, -1);
+      this.nx = Float32Array.from({ length: N }, (_, k) => nor.getX(k)); this.ny = Float32Array.from({ length: N }, (_, k) => nor.getY(k)); this.nz = Float32Array.from({ length: N }, (_, k) => nor.getZ(k));
+      for (let k = 0; k < N; k++) { const l = Math.hypot(this.nx[k], this.ny[k]) || 1; this.ex[k] = this.nx[k] / l; this.ey[k] = this.ny[k] / l; }
+      if (fold) {
+        this.fc = new Float32Array(N); this.fs = new Float32Array(N); this.fk = TAU / fold.wave;
+        for (let i = 0; i < n; i++) for (let j = 0; j < m; j++) {
+          const k = i * m + j, ph = TAU * (sList[i] + 1.1 * Math.cos(TAU * j / seg) + 0.6 * Math.sin(2 * TAU * j / seg)) / fold.wave;
+          this.fc[k] = Math.cos(ph); this.fs[k] = Math.sin(ph);
+        }
+      }
+      pos.set(geo.attributes.position.array);
+      geo.attributes.position.setUsage(35048); nor.setUsage(35048);
+      this.geo = geo; this.P = geo.attributes.position.array; this.N = nor.array;
+    }
+    update(BP, BQ, amp) {
+      const P = this.P, Nn = this.N, m = this.m;
+      for (let i = 0; i < this.n; i++) {
+        const R = this.rings[i], qa = BQ[R.ia], qb = BQ[R.ib];
+        _v1.set(0, 0, R.za * MM).applyQuaternion(qa).add(BP[R.ia]);
+        _v2.set(0, 0, R.zb * MM).applyQuaternion(qb).add(BP[R.ib]);
+        _v1.lerp(_v2, R.w);
+        _q1.slerpQuaternions(qa, qb, R.w);
+        const { x, y, z, w } = _q1;
+        const Xx = 1 - 2 * (y * y + z * z), Xy = 2 * (x * y + w * z), Xz = 2 * (x * z - w * y);
+        const Yx = 2 * (x * y - w * z), Yy = 1 - 2 * (x * x + z * z), Yz = 2 * (y * z + w * x);
+        const Zx = 2 * (x * z + w * y), Zy = 2 * (y * z - w * x), Zz = 1 - 2 * (x * x + y * y);
+        let D = 0, Dp = 0, Pm = 0, Pp = 0;
+        for (const g of R.jg) { D += g.g * amp.d[g.j]; Dp += g.dg * amp.d[g.j]; Pm += g.g * amp.p[g.j]; Pp += g.dg * amp.p[g.j]; }
+        const F = R.fw * amp.fold, cx = _v1.x, cy = _v1.y, cz = _v1.z;
+        for (let j = 0; j < m; j++) {
+          const k = i * m + j, md = this.md[k], mp = this.mp[k];
+          let dr = D * md + Pm * mp, ds = Dp * md + Pp * mp;
+          if (F) { dr -= F * mp * (0.5 + 0.5 * this.fc[k]); ds += F * mp * 0.5 * this.fs[k] * this.fk; }
+          const lx = (this.lx[k] + this.ex[k] * dr) * MM, ly = (this.ly[k] + this.ey[k] * dr) * MM;
+          P[k * 3] = cx + Xx * lx + Yx * ly; P[k * 3 + 1] = cy + Xy * lx + Yy * ly; P[k * 3 + 2] = cz + Xz * lx + Yz * ly;
+          const nx = this.nx[k], ny = this.ny[k], nz = this.nz[k] + ds;
+          let ox = Xx * nx + Yx * ny + Zx * nz, oy = Xy * nx + Yy * ny + Zy * nz, oz = Xz * nx + Yz * ny + Zz * nz;
+          const l = 1 / Math.hypot(ox, oy, oz); Nn[k * 3] = ox * l; Nn[k * 3 + 1] = oy * l; Nn[k * 3 + 2] = oz * l;
+        }
+      }
+      this.geo.attributes.position.needsUpdate = !0; this.geo.attributes.normal.needsUpdate = !0;
+    }
+  }
+
+  // nail: a thin curved plate in the distal bone's frame, tucked under the skin at its base and sides
+  function buildNail(S, side, mat) {
+    const NU = 20, NV = 12, top = [], bot = [], col = [], uvs = [], idx = [];
+    const J2 = S.J[2];
+    const lun = [208, 166, 154], body = [196, 138, 126], edge = [214, 192, 174], under = [lin(178), lin(118), lin(106)];
+    const surfY = (s, x) => { const [rx, ryD] = S.axes(Math.min(s, S.sC)); return ryD * Math.pow(Math.max(0, 1 - Math.pow(Math.min(1, Math.abs(x) / rx), 2.3)), 1 / 2.3); };
+    for (let i = 0; i <= NU; i++) for (let j = 0; j <= NV; j++) {
+      const u = i / NU, v = (j / NV) * 2 - 1;
+      const sb = S.nailBase + 2.2 * v * v, se = S.nailEnd - 1.8 * v * v, s = lerp(sb, se, u);
+      const [rx] = S.axes(Math.min(s, S.sC)), x = v * 0.66 * rx * (1 - 0.06 * u);
+      let off = 0.24 - 0.55 * Math.pow(Math.abs(v), 5) - 1.1 * (1 - sstep(u, 0, 0.07));
+      let y = surfY(s, x) + off + 0.18 * (1 - v * v);
+      if (s > S.sC) y -= 0.2 * Math.pow((s - S.sC) / (S.sEnd - S.sC), 2);
+      top.push(side * x, y, -(s - J2)); bot.push(side * x, y - 0.3, -(s - J2));
+      const lu = 0.2 * Math.sqrt(Math.max(0, 1 - 0.85 * v * v)), c = hmix(body, lun, (1 - sstep(u, lu - 0.04, lu + 0.03)) * sstep(u, 0.04, 0.09));
+      const c2 = hmix(c, edge, sstep(u, 0.93, 0.98));
+      col.push(lin(c2[0]), lin(c2[1]), lin(c2[2])); uvs.push(u, v);
+    }
+    const W = NV + 1, T = (NU + 1) * W;
+    for (let i = 0; i < NU; i++) for (let j = 0; j < NV; j++) {
+      const a = i * W + j, b = a + 1, c = a + W, d = c + 1;
+      if (side > 0) idx.push(a, b, c, b, d, c, T + a, T + c, T + b, T + b, T + c, T + d); else idx.push(a, c, b, b, c, d, T + a, T + b, T + c, T + b, T + d, T + c);
+    }
+    for (let j = 0; j < NV; j++) { // rim along the free edge
+      const a = NU * W + j, b = a + 1;
+      if (side > 0) idx.push(a, b, T + a, b, T + b, T + a); else idx.push(a, T + a, b, b, T + a, T + b);
+    }
+    const g = new de(), P = new Float32Array([...top, ...bot]).map((v) => v * MM);
+    g.setAttribute("position", new $t(P, 3)); g.setAttribute("color", new $t([...col, ...col.map((c, k) => under[k % 3])], 3)); g.setAttribute("uv", new $t([...uvs, ...uvs], 2));
+    g.setIndex(idx); g.computeVertexNormals();
+    return new Mesh3(g, mat);
+  }
+
+  /* ---------- painted materials ---------- */
+  const hh = (x, y) => { let h = (Math.imul(x | 0, 374761393) + Math.imul(y | 0, 668265263)) | 0; h = Math.imul(h ^ (h >>> 13), 1274126177); return ((h ^ (h >>> 16)) >>> 0) / 4294967296; };
+  function pnoise(x, y, px = 1e6, py = 1e6) { // value noise, periodic over px × py lattice cells
+    const xi = Math.floor(x), yi = Math.floor(y), xf = x - xi, yf = y - yi, u = xf * xf * (3 - 2 * xf), v = yf * yf * (3 - 2 * yf);
+    const x0 = ((xi % px) + px) % px, x1 = (x0 + 1) % px, y0 = ((yi % py) + py) % py, y1 = (y0 + 1) % py;
+    const a = hh(x0, y0), b = hh(x1, y0), c = hh(x0, y1), d = hh(x1, y1);
+    return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+  }
+  const pfbm = (x, y, px, py, o = 4) => { let s = 0, a = 0.5, f = 1; for (let i = 0; i < o; i++) { s += a * pnoise(x * f, y * f, px * f, py * f); f *= 2; a *= 0.5; } return s / (1 - Math.pow(0.5, o)); };
+  function pcell(x, y, px, py) { // periodic Voronoi: [d1, d2, cell random]
+    const xi = Math.floor(x), yi = Math.floor(y); let d1 = 9, d2 = 9, id = 0;
+    for (let j = -1; j <= 1; j++) for (let i = -1; i <= 1; i++) {
+      const cx = xi + i, cy = yi + j, wx = ((cx % px) + px) % px, wy = ((cy % py) + py) % py;
+      const d = Math.hypot(cx + hh(wx, wy) - x, cy + hh(wy + 31, wx - 17) - y);
+      if (d < d1) { d2 = d1; d1 = d; id = hh(wx + 7, wy + 3); } else if (d < d2) d2 = d;
+    }
+    return [d1, d2, id];
+  }
+  /* Textures are painted in small slices while the menu is up, so loading the page does not stall:
+     each canvas starts as a flat tint and is refreshed on the GPU once its painting is done. */
+  const BAKE_Q = []; let bakeTimer = 0;
+  function pumpBakes() {
+    bakeTimer = 0; const t0 = performance.now();
+    while (BAKE_Q.length && performance.now() - t0 < 8) if (BAKE_Q[0].next().done) BAKE_Q.shift();
+    if (BAKE_Q.length) bakeTimer = setTimeout(pumpBakes, 0);
+  }
+  // colour + height (mm) + roughness → three canvases; sx, sy: mm per pixel; columns of wrapCol pixels wrap around
+  function bake(W, H, fn, sx, sy, wrapCol = W, fill = [200, 200, 200]) {
+    const mk = (rgb) => { const c = document.createElement("canvas"); c.width = W; c.height = H; const g = c.getContext("2d"); g.fillStyle = `rgb(${rgb.map(Math.round)})`; g.fillRect(0, 0, W, H); return c; };
+    const out = { color: mk(fill), normal: mk([128, 128, 255]), rough: mk([180, 180, 180]), done: [] };
+    BAKE_Q.push((function* () {
+      const col = new Uint8ClampedArray(W * H * 4), rgh = new Uint8ClampedArray(W * H * 4), hgt = new Float32Array(W * H), o = { c: [0, 0, 0], h: 0, r: 0.7 };
+      for (let y = 0; y < H; y++) {
+        for (let x = 0; x < W; x++) {
+          fn(x, y, o); const i = y * W + x, q = i * 4;
+          col[q] = o.c[0]; col[q + 1] = o.c[1]; col[q + 2] = o.c[2]; col[q + 3] = 255;
+          hgt[i] = o.h; rgh[q] = rgh[q + 1] = rgh[q + 2] = o.r * 255; rgh[q + 3] = 255;
+        }
+        if ((y & 3) === 3) yield;
+      }
+      const nor = new Uint8ClampedArray(W * H * 4);
+      for (let y = 0; y < H; y++) {
+        for (let x = 0; x < W; x++) {
+          const c0 = x - (x % wrapCol), xl = c0 + ((x - c0 - 1 + wrapCol) % wrapCol), xr = c0 + ((x - c0 + 1) % wrapCol), yu = (y - 1 + H) % H, yd = (y + 1) % H;
+          const nx = -(hgt[y * W + xr] - hgt[y * W + xl]) / (2 * sx), ny = (hgt[yd * W + x] - hgt[yu * W + x]) / (2 * sy), l = 1 / Math.hypot(nx, ny, 1), q = (y * W + x) * 4;
+          nor[q] = (nx * l * 0.5 + 0.5) * 255; nor[q + 1] = (ny * l * 0.5 + 0.5) * 255; nor[q + 2] = (l * 0.5 + 0.5) * 255; nor[q + 3] = 255;
+        }
+        if ((y & 15) === 15) yield;
+      }
+      for (const [c, d] of [[out.color, col], [out.normal, nor], [out.rough, rgh]]) c.getContext("2d").putImageData(new ImageData(d, W, H), 0, 0);
+      for (const f of out.done) f();
+    })());
+    if (!bakeTimer) bakeTimer = setTimeout(pumpBakes, 0);
+    return out;
+  }
+  function texSet(b, repeat) {
+    const t = (c, srgb) => { const x = new He(c); if (srgb) x.colorSpace = fe; x.anisotropy = 8; if (repeat) x.wrapS = x.wrapT = Ln; return x; };
+    const set = { map: t(b.color, !0), normalMap: t(b.normal), roughnessMap: t(b.rough) };
+    b.done.push(() => { for (const k in set) set[k].needsUpdate = !0; });
+    return set;
+  }
+  const shade = (c, k) => [c[0] * k, c[1] * k, c[2] * k];
+  // knit loops (wale, course in cells); returns 0..1
+  function knitH(u, v) {
+    const fu = u - Math.floor(u), fv = v - Math.floor(v), t = fv - 0.5;
+    const d = fu < 0.5 ? Math.abs(fu - 0.25 - 0.17 * t) : Math.abs(fu - 0.75 + 0.17 * t);
+    return Math.max(0, 1 - (d / 0.21) * (d / 0.21)) * (0.72 + 0.28 * Math.sin(Math.PI * fv));
+  }
+  function leatherH(x, y, px, py) { const [d1, d2, id] = pcell(x, y, px, py), e = d2 - d1; return [sstep(e, 0, 0.32) * (0.75 + 0.25 * id), e]; }
+
+  /* Skin-like and fabric-like shading on top of the standard material: light wraps a little past the
+     terminator and reddens there, thin edges glow when backlit, fabrics get a soft sheen at grazing angles. */
+  function shadeExtra(mat, key, { sss = [0, 0, 0], wrap = 0.5, trans = [0, 0, 0], sheen = [0, 0, 0] }) {
+    mat.onBeforeCompile = (sh) => {
+      sh.uniforms.hSss = { value: new Vec3(...sss) }; sh.uniforms.hTrans = { value: new Vec3(...trans) };
+      sh.uniforms.hSheen = { value: new Vec3(...sheen) }; sh.uniforms.hWrap = { value: wrap };
+      sh.fragmentShader = sh.fragmentShader.replace("#include <common>", "#include <common>\nuniform vec3 hSss; uniform vec3 hTrans; uniform vec3 hSheen; uniform float hWrap;")
+        .replace("#include <opaque_fragment>", `#if NUM_DIR_LIGHTS > 0
+        {
+          vec3 hL = directionalLights[ 0 ].direction, hC = directionalLights[ 0 ].color;
+          float hN = dot( normal, hL );
+          float hW = max( 0.0, ( hN + hWrap ) / ( 1.0 + hWrap ) ) - max( 0.0, hN );
+          float hT = pow( clamp( dot( geometryViewDir, -( hL + normal * 0.4 ) ), 0.0, 1.0 ), 3.0 );
+          float hF = pow( 1.0 - clamp( dot( normal, geometryViewDir ), 0.0, 1.0 ), 4.0 );
+          outgoingLight += hC * RECIPROCAL_PI * ( diffuseColor.rgb * ( hSss * hW + hTrans * hT ) + hSheen * hF * ( 0.35 + 0.65 * max( hN, 0.0 ) ) );
+        }
+        #endif
+        #include <opaque_fragment>`);
+    };
+    mat.customProgramCacheKey = () => "hand-" + key;
+    return mat;
+  }
+
+  function makeHandLook() {
+    const L = {};
+    // finger skin atlas: one 128 px column per digit (index, middle, ring, pinky, thumb); x: around, y: along
+    const CW = 128, AH = 512, AW = CW * 5;
+    const dorsalC = [180, 128, 104], palmarC = [206, 156, 136], knuckleC = [190, 118, 102], pulpC = [212, 144, 130], foldC = [184, 110, 96];
+    const atlas = bake(AW, AH, (x, y, o) => {
+      const S = SHAPES[(x / CW) | 0], xc = x % CW, th = TAU * (xc + 0.5) / CW, s = S.s0 + (S.sEnd - S.s0) * (y + 0.5) / AH, dor = Math.sin(th);
+      const wd = sstep(dor, 0.1, 0.6), wp = sstep(-dor, 0.15, 0.55);
+      let h = 0.012 * (pnoise(xc * 0.5, s * 2.4, CW * 0.5) - 0.5) + 0.008 * (pnoise(xc * 1.3, s * 6.5, Math.round(CW * 1.3)) - 0.5), crease = 0, knuck = 0;
+      const ridges = (J, gap, width, depth, n) => { // dorsal wrinkles over a joint, bowing towards the fingertip at the sides
+        const dz = s - J - 1.3 * (1 - dor) - 0.5 * (pnoise(xc * 0.06 + J, s * 0.4, 1e6) - 0.5), env = gauss(dz, width) * wd, ph = dz / gap + n, f = ph - Math.floor(ph);
+        const broken = sstep(pnoise(xc * 0.14 + J * 3, Math.floor(ph) * 1.7 + 0.5, 1e6), 0.25, 0.75);
+        crease += depth * env * broken * gauss(f - 0.5, 0.13); knuck = Math.max(knuck, env);
+      };
+      if (S.thumb) { ridges(S.J[2], 0.95, 1.9, 0.045, 0.3); } else { ridges(S.J[1], 1.05, 2.1, 0.05, 0.1); ridges(S.J[2], 0.85, 1.5, 0.035, 0.6); }
+      const pc = (c, w, d) => { crease += d * wp * gauss(s - c, w); };
+      if (S.thumb) pc(S.J[2] + 0.3, 0.3, 0.12); else { pc(S.J[1] - 0.5, 0.28, 0.12); pc(S.J[1] + 0.7, 0.26, 0.1); pc(S.J[2] + 0.4, 0.28, 0.1); }
+      h += 0.07 * knuck - crease;
+      let c = hmix(dorsalC, palmarC, sstep(-dor, -0.3, 0.5));
+      c = hmix(c, knuckleC, 0.55 * knuck);
+      c = hmix(c, pulpC, 0.6 * wp * sstep(s, S.J[2] + 0.3 * S.Ls[2], S.sEnd));
+      c = hmix(c, foldC, 0.4 * wd * gauss(s - S.nailBase + 0.8, 1.6));
+      c = shade(c, (0.95 + 0.08 * pfbm(xc / 16, s / 7, CW / 16, 1e6, 3)) * (1 - 1.3 * crease));
+      o.c = c; o.h = h;
+      o.r = clamp(0.62 - 0.1 * wp - 0.06 * wp * sstep(s, S.J[2], S.sEnd) + 1.2 * crease + 0.04 * knuck, 0.35, 0.9);
+    }, 2 * Math.PI * 8.5 / CW, 85 / AH, CW, dorsalC);
+    L.skin = shadeExtra(new ge({ ...texSet(atlas), roughness: 1, normalScale: new xt(0.9, 0.9) }), "skin", { sss: [0.3, 0.09, 0.06], wrap: 0.45, trans: [0.3, 0.07, 0.04] });
+    L.nail = shadeExtra(new ge({ vertexColors: !0, roughness: 0.28 }), "nail", { sss: [0.3, 0.1, 0.07], wrap: 0.4, trans: [0.2, 0.06, 0.04] });
+
+    // glove finger sleeves: x around (dorsal knit, palmar leather, piped side seams), y from the hem (48 mm)
+    const GW = 256, GH = 256, gmm = 48 / GH, knitC = [50, 52, 52], leathC = [40, 37, 34], threadC = [80, 80, 75], pipeC = [30, 30, 30];
+    const gf = bake(GW, GH, (x, y, o) => {
+      const th = TAU * (x + 0.5) / GW, e = (y + 0.5) * gmm, dor = Math.sin(th), side = Math.min(Math.abs(Math.sin(th)), 1) * 11;
+      const dseam = Math.min(Math.abs(th), Math.abs(th - Math.PI), Math.abs(th - TAU)) * 11; // mm from a side seam
+      let h, c, r;
+      if (dor > 0) { h = 0.1 * knitH(x / GW * 100, e / 0.56); c = shade(knitC, 0.9 + 0.16 * h / 0.1 + 0.05 * (pnoise(x / 8, e * 1.2, GW / 8) - 0.5)); r = 0.9; }
+      else {
+        const [lh] = leatherH(x / GW * 92, e / 0.95, 92, 1e6), wear = sstep(pfbm(x / 32, e / 9, 8, 1e6, 3), 0.55, 0.8) * 0.6;
+        h = 0.05 * lh; c = shade(leathC, (0.86 + 0.2 * lh) * (1 + 0.35 * wear)); r = 0.64 - 0.08 * lh - 0.14 * wear;
+      }
+      if (dseam < 0.9) { h = 0.22 * Math.cos(Math.PI * dseam / 1.8); c = pipeC; r = 0.55; }
+      const dash = (t, per, len) => { const f = t / per - Math.floor(t / per); return sstep(f, 0, 0.08) * (1 - sstep(f, len - 0.08, len)); };
+      const st1 = gauss(dseam - 1.6, 0.22) * dash(e, 2.2, 0.62);
+      const st2 = gauss(e - 3.0, 0.22) * dash(th * 11, 2.2, 0.62);
+      const st = Math.max(st1, st2);
+      if (st > 0.05) { h += 0.12 * st; c = hmix(c, threadC, st); r = lerp(r, 0.75, st); }
+      h -= 0.04 * gauss(e - 3.0, 0.5) * (1 - st);
+      o.c = c; o.h = h; o.r = r;
+    }, 2 * Math.PI * 11 / GW, gmm, GW, [46, 46, 46]);
+    L.gloveFinger = shadeExtra(new ge({ ...texSet(gf, !0), roughness: 1, normalScale: new xt(1, 1) }), "gfinger", { sheen: [0.07, 0.07, 0.07] });
+
+    // 36 mm tiles for the glove body (the bundle's tube and pad UVs are in units of 36 mm)
+    const T = 256, tmm = 36 / T;
+    const knit = bake(T, T, (x, y, o) => {
+      const k = knitH(x / T * 52, y / T * 64), f = pfbm(x / T * 16, y / T * 16, 16, 16, 3);
+      o.h = 0.1 * k + 0.02 * (f - 0.5); const g = 214 + 38 * k + 14 * (f - 0.5); o.c = [g, g, g]; o.r = 0.9 - 0.05 * k;
+    }, tmm, tmm);
+    L.knit = shadeExtra(new ge({ ...texSet(knit, !0), vertexColors: !0, roughness: 1 }), "knit", { sheen: [0.06, 0.06, 0.06] });
+    const leath = bake(T, T, (x, y, o) => {
+      const [lh] = leatherH(x / T * 38, y / T * 38, 38, 38), f = pfbm(x / T * 4, y / T * 4, 4, 4, 3);
+      o.h = 0.055 * lh + 0.01 * (pnoise(x / 2, y / 2, T / 2, T / 2) - 0.5); const g = (200 + 40 * lh) * (0.94 + 0.12 * f); o.c = [g, g, g]; o.r = 0.7 - 0.12 * lh;
+    }, tmm, tmm);
+    L.leather = new ge({ ...texSet(leath, !0), vertexColors: !0, roughness: 1 });
+    const rub = bake(T, T, (x, y, o) => {
+      const f = pnoise(x / 1.6, y / 1.6, T / 1.6 | 0, T / 1.6 | 0), g = pfbm(x / T * 8, y / T * 8, 8, 8, 3);
+      o.h = 0.012 * f; const v = 226 + 10 * (g - 0.5); o.c = [v, v, v]; o.r = 0.5 + 0.06 * f;
+    }, tmm, tmm);
+    L.rubber = new ge({ ...texSet(rub, !0), vertexColors: !0, roughness: 1 });
+    const rib = bake(T, T, (x, y, o) => {
+      const r = 0.5 + 0.5 * Math.cos(TAU * x / T * 18), k = knitH(x / T * 72, y / T * 72);
+      o.h = 0.16 * r * r + 0.03 * k; const g = 200 + 46 * r + 10 * k; o.c = [g, g, g]; o.r = 0.9;
+    }, tmm, tmm);
+    L.rib = shadeExtra(new ge({ ...texSet(rib, !0), vertexColors: !0, roughness: 1 }), "rib", { sheen: [0.05, 0.05, 0.05] });
+    // softshell: fine twill, 40 mm tile
+    const soft = bake(T, T, (x, y, o) => {
+      const tw = 0.5 + 0.5 * Math.cos(TAU * (x + y) / T * 56), f = pnoise(x / 1.5, y / 1.5, T / 1.5 | 0, T / 1.5 | 0), m = pfbm(x / T * 6, y / T * 6, 6, 6, 3);
+      o.h = 0.022 * tw + 0.006 * f; const g = (222 + 22 * tw + 6 * f) * (0.95 + 0.1 * m); o.c = [g, g, g]; o.r = 0.8 + 0.04 * f;
+    }, 40 / T, 40 / T);
+    L.sleeve = shadeExtra(new ge({ ...texSet(soft, !0), vertexColors: !0, roughness: 1 }), "sleeve", { sheen: [0.09, 0.09, 0.1] });
+    L.lining = new ge({ vertexColors: !0, roughness: 0.95 });
+    return L;
+  }
+
+  /* ---------- glove cuff with a velcro strap, and the jacket sleeve ---------- */
+  // closed band around the z axis: rings in profile order [{z, ax, ay, d?(th)}]; u in units of 36 mm (repeats rounded)
+  function bandGeo(rings, seg, side, tile = 36, colorOf = null) {
+    const m = seg + 1, pos = [], uv = [], col = [], idx = [];
+    let len = 0;
+    const rep = Math.max(1, Math.round(Math.PI * Math.max(...rings.map((R) => R.ax + R.ay)) / tile));
+    for (let i = 0; i < rings.length; i++) {
+      const R = rings[i];
+      if (i) { const P = rings[i - 1]; len += Math.hypot(R.z - P.z, (R.ax + R.ay - P.ax - P.ay) / 2); }
+      for (let j = 0; j < m; j++) {
+        const th = TAU * j / seg, [px, py] = sePt(Math.cos(th), Math.sin(th)), d = R.d ? R.d(th) : 0;
+        const l = Math.hypot(px * R.ay, py * R.ax) || 1, nx = px * R.ay / l, ny = py * R.ax / l;
+        pos.push(side * (R.ax * px + nx * d) * MM, (R.ay * py + ny * d) * MM, R.z * MM);
+        uv.push(rep * j / seg, len / tile);
+        if (colorOf) { const c = colorOf(R, th, d); col.push(lin(c[0]), lin(c[1]), lin(c[2])); }
+      }
+    }
+    for (let i = 0; i < rings.length - 1; i++) for (let j = 0; j < seg; j++) {
+      const a = i * m + j, b = a + 1, c = a + m, d = c + 1;
+      if (side > 0) idx.push(a, b, c, b, d, c); else idx.push(a, c, b, b, c, d);
+    }
+    const g = new de(); g.setAttribute("position", new $t(pos, 3)); g.setAttribute("uv", new $t(uv, 2)); if (colorOf) g.setAttribute("color", new $t(col, 3));
+    g.setIndex(idx); g.computeVertexNormals();
+    const n = g.attributes.normal;
+    for (let i = 0; i < rings.length; i++) { const a = i * m, b = a + seg; _v1.fromBufferAttribute(n, a).add(_v2.fromBufferAttribute(n, b)).normalize(); n.setXYZ(a, _v1.x, _v1.y, _v1.z); n.setXYZ(b, _v1.x, _v1.y, _v1.z); }
+    return g;
+  }
+  // point and outward normal on a superellipse band surface (mm)
+  function bandPoint(ax, ay, th, lift, side, out) {
+    const [px, py] = sePt(Math.cos(th), Math.sin(th)), l = Math.hypot(px * ay, py * ax) || 1;
+    return out.set(side * (ax * px + px * ay / l * lift), ay * py + py * ax / l * lift, 0);
+  }
+  // a padded patch lying on a band (tab, logo): outline is a rounded rectangle in (arc mm, z mm)
+  function bandPatch(merger, mat, color, side, ax, ay, thC, zC, halfA, halfZ, thick, lift0, endLift, stitchMat, threadColor) {
+    const N = 44, out = [], rim = [];
+    for (let k = 0; k < N; k++) { const t = TAU * k / N, c = Math.cos(t), s = Math.sin(t); out.push([halfA * Math.sign(c) * Math.pow(Math.abs(c), 0.5), halfZ * Math.sign(s) * Math.pow(Math.abs(s), 0.5)]); }
+    const layers = [[1, 0], [1.0, 0.45 * thick], [0.97, 0.85 * thick], [0.9, thick], [0.4, thick * 1.02], [0, thick * 1.02]];
+    const rMean = (ax + ay) / 2, pos = [], uv = [], idx = [], P = new Vec3();
+    for (const [sc, hgt] of layers) for (const [aa, zz] of out) {
+      const a = aa * sc, z = zz * sc, lift = lift0 + hgt + endLift * sstep(a / halfA, 0.25, 1);
+      bandPoint(ax, ay, thC + side * a / rMean, lift, side, P);
+      pos.push(P.x * MM, P.y * MM, (zC + z) * MM); uv.push(a / 36, z / 36);
+    }
+    for (let L = 0; L < layers.length - 1; L++) for (let k = 0; k < N; k++) {
+      const a = L * N + k, b = L * N + (k + 1) % N, c = a + N, d = b + N;
+      if (side > 0) idx.push(a, b, c, b, d, c); else idx.push(a, c, b, b, c, d);
+    }
+    const g = new de(); g.setAttribute("position", new $t(pos, 3)); g.setAttribute("uv", new $t(uv, 2)); g.setIndex(idx); g.computeVertexNormals();
+    merger.add(mat, color, g);
+    if (stitchMat) {
+      for (const [aa, zz] of out) { const a = aa * 0.8, z = zz * 0.8; bandPoint(ax, ay, thC + side * a / rMean, lift0 + thick * 1.03 + endLift * sstep(a / halfA, 0.25, 1), side, P); rim.push(new Vec3(P.x * MM, P.y * MM, (zC + z) * MM)); }
+      $r(merger, stitchMat, rim, !0, 0.0034, threadColor);
+    }
+  }
+  const GLOVE_COL = { knit: 0x323434, leather: 0x282522, rubber: 0x1e1f1f, thread: 0x50504b, strap: 0x262422, rib: 0x2e3030 };
+  function buildCuff(side, mats) {
+    const c = Zr(), ax = 35.4, ay = 24.0;
+    // elastic ribbed band
+    c.add(mats.rib, GLOVE_COL.rib, bandGeo([
+      { z: -5.8, ax: ax - 2.6, ay: ay - 2.6 }, { z: -7.6, ax: ax - 1.2, ay: ay - 1.2 }, { z: -7.4, ax: ax - 0.2, ay: ay - 0.2 }, { z: -6.2, ax, ay },
+      ...[-3, 0, 3, 6, 9, 12].map((z) => ({ z, ax, ay })), { z: 14.4, ax: ax + 0.2, ay: ay + 0.2 }, { z: 15.6, ax: ax - 0.4, ay: ay - 0.4 }, { z: 15.8, ax: ax - 1.6, ay: ay - 1.6 }, { z: 14.6, ax: ax - 2.8, ay: ay - 2.8 },
+    ], 40, side));
+    // strap around the wrist
+    const sx = ax + 2.1, sy = ay + 2.1;
+    c.add(mats.hide, GLOVE_COL.strap, bandGeo([
+      { z: -2.6, ax: ax - 0.1, ay: ay - 0.1 }, { z: -3.4, ax: sx - 1.1, ay: sy - 1.1 }, { z: -3.0, ax: sx - 0.25, ay: sy - 0.25 }, { z: -2.0, ax: sx, ay: sy },
+      { z: 3, ax: sx, ay: sy }, { z: 8, ax: sx, ay: sy }, { z: 11.6, ax: sx, ay: sy }, { z: 12.6, ax: sx - 0.25, ay: sy - 0.25 }, { z: 13.0, ax: sx - 1.1, ay: sy - 1.1 }, { z: 12.2, ax: ax - 0.1, ay: ay - 0.1 },
+    ], 40, side));
+    for (const z of [-1.5, 11.1]) {
+      const pts = []; for (let k = 0; k < 64; k++) { bandPoint(sx, sy, TAU * k / 64, 0.12, side, _v1); pts.push(new Vec3(_v1.x * MM, _v1.y * MM, z * MM)); }
+      $r(c, mats.trim, pts, !0, 0.0034, GLOVE_COL.thread);
+    }
+    // pull tab on the thumb side of the back of the wrist, and a small rubber badge on it
+    const thTab = Math.PI / 2 + 0.5;
+    bandPatch(c, mats.hide, GLOVE_COL.strap, side, sx, sy, thTab, 4.8, 14, 8.6, 1.7, 0.05, 1.1, mats.trim, GLOVE_COL.thread);
+    bandPatch(c, mats.rubber, GLOVE_COL.rubber, side, sx, sy, thTab + 0.06, 4.8, 6, 3.4, 0.7, 1.75, 0.5, null);
+    return c.finish();
+  }
+
+  const FOREARM = [[-12, 37, 26], [16, 39, 27], [38, 42, 29], [63, 44, 32], [94, 49, 37], [128, 55, 43], [163, 61, 50], [200, 65, 55], [240, 69, 55], [280, 69, 52], [320, 64, 49], [360, 60, 47]];
+  function forearmAt(z) { // half-widths of the bare forearm (mm) as placed in the scene
+    let i = 0; while (i < FOREARM.length - 2 && FOREARM[i + 1][0] < z) i++;
+    const a = FOREARM[i], b = FOREARM[i + 1], t = clamp((z - a[0]) / (b[0] - a[0]), 0, 1);
+    return [lerp(a[1], b[1], t) * 0.77, lerp(a[2], b[2], t) * 0.84];
+  }
+  const SEAM_TH = Math.PI / 2 + 1.05;  // outer panel seam of the sleeve
+  const angDist = (a, b) => Math.abs(Math.atan2(Math.sin(a - b), Math.cos(a - b)));
+  function sleeveFolds(th, z) { // outward displacement (mm) of the sleeve fabric
+    let d = 0;
+    // fabric stacked above the cuff: broken, wavy rings
+    const amp = [2.4, 2.9, 2.3, 1.7, 1.2];
+    for (let k = 0; k < 5; k++) {
+      const zk = 40 + 13.5 * k + 3 * Math.sin(k * 2.1) + 2.2 * (pnoise(th / TAU * 4 + k * 3.1, k * 1.7, 4) - 0.5);
+      const ridge = gauss(z - zk - 3.6 * Math.sin(th + 1.7 * k) - 1.6 * Math.sin(2 * th + k), 3.1 + 0.5 * k);
+      d += amp[k] * ridge * sstep(pnoise(th / TAU * 5 + k * 2.3, k * 4.1 + 0.5, 5), 0.18, 0.75);
+    }
+    // looser drapes along the forearm, and the fabric sagging on the underside
+    const far = sstep(z, 90, 160);
+    d += far * (2.6 * Math.pow(0.5 + 0.5 * Math.sin(th + z / 55 + 0.6), 4) + 1.8 * Math.pow(0.5 + 0.5 * Math.sin(2 * th - z / 70 + 2.1), 5)
+      + 1.6 * Math.pow(Math.max(0, -Math.sin(th)), 2) * (0.5 + 0.5 * Math.sin(z / 34 + 1.3 * Math.cos(th))));
+    d += 1.1 * (pfbm(th / TAU * 6, z / 30, 6, 1e6, 3) - 0.5);
+    d += 0.55 * gauss(angDist(th, SEAM_TH) * 45, 1.1) + 0.45 * gauss(angDist(th, -Math.PI / 2) * 40, 1.3); // seams
+    return Math.max(0, d);
+  }
+  function buildSleeve(side, mats) {
+    const g = new Group3(), base = [74, 80, 88];
+    g.add(buildForearm(side, mats, 5)); // bare wrist between the glove and the sleeve
+    // the sleeve: lining inside the opening, rolled hem, then the folded outer fabric up to the elbow
+    const ease = (z) => 6.2 + 4.2 * sstep(z, 40, 170);
+    const outer = (z, e) => { const [fx, fy] = forearmAt(z); return { z, ax: fx + e, ay: fy + e - 1 }; };
+    const rings = [];
+    for (const z of [52, 40, 31]) rings.push({ ...outer(z, 3.3), lining: !0 });
+    rings.push({ ...outer(27.4, 4.6), lining: !0 }, outer(26.2, 5.6), outer(27.4, 6.4), outer(29.5, 6.6));
+    for (let z = 32; z <= 382; z += z < 110 ? 1.5 : 3.5) { const R = outer(z, ease(z)); R.d = (th) => sleeveFolds(th, z); rings.push(R); }
+    const geo = bandGeo(rings, 56, side, 40, (R, th, d) => {
+      if (R.lining) return [34, 35, 38];
+      const seam = Math.max(gauss(angDist(th, SEAM_TH) * 45, 0.7), gauss(angDist(th, -Math.PI / 2) * 40, 0.8));
+      const k = (0.78 + 0.22 * sstep(d, 0.2, 2.6)) * (1 - 0.3 * seam) * (R.z < 30 ? 0.85 : 1);
+      return shade(base, k);
+    });
+    g.add(new Mesh3(geo, mats.sleeve));
+    // stitches along the outer panel seam, and a velcro adjustment tab at the cuff
+    const c = Zr();
+    for (const off of [-2.2, 2.2]) {
+      const pts = [];
+      for (let z = 34; z <= 330; z += 4) {
+        const R = outer(z, ease(z)), th = SEAM_TH + off / ((R.ax + R.ay) / 2), d = sleeveFolds(th, z) + 0.15;
+        bandPoint(R.ax, R.ay, th, d, side, _v1); pts.push(new Vec3(_v1.x * MM, _v1.y * MM, z * MM));
+      }
+      $r(c, mats.trim, pts, !1, 0.0042, 0x2b2e33);
+    }
+    const [fx, fy] = forearmAt(44), thT = Math.PI / 2 + 0.75;
+    bandPatch(c, mats.sleeve, 0x444a52, side, fx + 6.2 + sleeveFolds(thT, 44) * 0.4, fy + 5.2, thT, 44, 13, 9, 1.6, 0.6, 0.8, mats.trim, 0x2b2e33);
+    g.add(c.finish());
+    return g;
+  }
+
+  /* ---------------- glove body (bundle: bi tube, Zr merger, $r stitches, Jr pads) ---------------- */
   function buildPalm(side, mats) {
-    const { textile: e, hide: i, trim: s } = mats, c = Zr();
-    c.add(e, Nd, bi([[0, 0, 13, 33, 23], [0, 0, 2, 34, 23], [side, 0, -17, 39, 25], [0, 0, -39, 48, 28], [0, 0, -62, 53, 30], [0, 0, -82, 52, 29], [0, 0, -94, 47, 24], [0, 2, -102, 38, 18]], 0.78));
+    const { textile: e, hide: i, trim: s, rubber: rb } = mats, c = Zr(), K = GLOVE_COL;
+    c.add(e, K.knit, bi([[0, 0, 13, 33, 23], [0, 0, 2, 34, 23], [side, 0, -17, 39, 25], [0, 0, -39, 48, 28], [0, 0, -62, 53, 30], [0, 0, -82, 52, 29], [0, 0, -94, 47, 24], [0, 2, -102, 38, 18]], 0.78));
     const p = (P) => P.map(([x, z]) => [side * x, z]);
-    Jr(c, i, 3486513, p([[-34, -20], [-18, -13], [-4, -22], [4, -38], [1, -51], [-12, -57], [-29, -49], [-39, -32]]), 2, s, -1);
-    Jr(c, i, 2698026, p([[11, -28], [26, -21], [40, -36], [46, -59], [38, -75], [15, -76], [3, -63], [10, -51]]), 2.5, s, -1);
-    Jr(c, i, ah, p([[-34, -17], [-15, -10], [16, -12], [34, -24], [36, -43], [23, -58], [7, -54], [-15, -60], [-34, -49], [-39, -31]]), 2.9, s);
-    Jr(c, i, Fd, p([[-47, -68], [-34, -61], [-14, -64], [9, -63], [31, -64], [48, -71], [45, -87], [28, -89], [9, -94], [-17, -95], [-41, -89]]), 2.4);
+    Jr(c, i, K.leather, p([[-34, -20], [-18, -13], [-4, -22], [4, -38], [1, -51], [-12, -57], [-29, -49], [-39, -32]]), 2, s, -1);
+    Jr(c, i, K.leather, p([[11, -28], [26, -21], [40, -36], [46, -59], [38, -75], [15, -76], [3, -63], [10, -51]]), 2.5, s, -1);
+    Jr(c, i, K.leather, p([[-34, -17], [-15, -10], [16, -12], [34, -24], [36, -43], [23, -58], [7, -54], [-15, -60], [-34, -49], [-39, -31]]), 2.9, s);
+    Jr(c, rb, K.rubber, p([[-47, -68], [-34, -61], [-14, -64], [9, -63], [31, -64], [48, -71], [45, -87], [28, -89], [9, -94], [-17, -95], [-41, -89]]), 2.4);
     for (let P = 0; P < 4; P++) {
       const W = -37.5 + P * 24.5, o = [-1, -4, -2, 3][P];
-      Jr(c, i, P % 2 ? 3947575 : 4342334, p([[-10, -7], [-7, -11], [5, -12], [10, -7], [10, 4], [6, 8], [-6, 9], [-10, 4]].map(([x, z]) => [W + x, -78 + z + o])), 3.7);
+      Jr(c, rb, K.rubber, p([[-10, -7], [-7, -11], [5, -12], [10, -7], [10, 4], [6, 8], [-6, 9], [-10, 4]].map(([x, z]) => [W + x, -78 + z + o])), 3.7);
     }
-    for (const P of [-7, 7]) $r(c, s, [[-18, -25], [-12, -34], [-10, -42], [-4, -48]].map(([x, z]) => new Vec3(side * (x + P) * MM, (zd(x + P, z) + 4.4) * MM, z * MM)), !1, 0.0042, lh);
-    const g = c.finish(); g.scale.y = PALM_Y; return g;
+    for (const P of [-7, 7]) $r(c, s, [[-18, -25], [-12, -34], [-10, -42], [-4, -48]].map(([x, z]) => new Vec3(side * (x + P) * MM, (zd(x + P, z) + 4.4) * MM, z * MM)), !1, 0.0042, K.thread);
+    const g = c.finish(); g.scale.y = PALM_Y;
+    // tone-on-tone thread everywhere, and wear where leather and rubber roll over an edge or rub
+    const th = new Jt(K.thread);
+    for (const m of g.children) {
+      const col = m.geometry.attributes.color, pos = m.geometry.attributes.position, nor = m.geometry.attributes.normal;
+      if (m.material === s) { for (let k = 0; k < col.count; k++) col.setXYZ(k, th.r, th.g, th.b); continue; }
+      if (m.material !== i && m.material !== rb) continue;
+      for (let k = 0; k < col.count; k++) {
+        const x = pos.getX(k) / MM, z = pos.getZ(k) / MM, edge = sstep(1 - Math.abs(nor.getY(k)), 0.3, 0.8);
+        const w = 0.5 * edge + 0.3 * sstep(pnoise(x * 0.22 + 40, z * 0.22), 0.5, 0.8), k2 = 1 + (m.material === rb ? 0.35 : 0.6) * w;
+        col.setXYZ(k, col.getX(k) * k2, col.getY(k) * k2, col.getZ(k) * k2);
+      }
+    }
+    return g;
   }
-  function buildCuff(side, mats) {
-    const a = Zr(), hide = mats.hide;
-    a.add(hide, Fd, bi([[0, 0, -9, 43, 32], [0, 0, -5, 46, 35], [0, 0, 8, 47, 36], [0, 0, 16, 45, 34]], 0.89, 2));
-    a.add(hide, 4014141, bi([[0, 0, 7, 47, 36], [0, 0, 9, 47.5, 36.5], [0, 0, 11, 47, 36]], 0.89, 2));
-    const ring = []; for (let k = 0; k < 20; k++) { const W = TAU * k / 20; ring.push(new Vec3(0.0468 * Math.cos(W), 0.0358 * Math.sin(W), 0.002)); }
-    $r(a, mats.trim, ring, !0, 0.0058, lh);
-    const g = a.finish(); g.scale.set(0.84, 0.72, 1); return g;
-  }
-  function buildForearm(side, mats) {
-    const d = bi([[0, 0, -12, 37, 26], [0, 0, 16, 39, 27], [-2 * side, 1, 38, 42, 29], [-3 * side, 1, 63, 44, 32], [-4 * side, 2, 94, 49, 37], [-5 * side, 1, 128, 55, 43], [-4 * side, 0, 163, 61, 50], [0, -3, 200, 65, 55], [3 * side, -5, 240, 69, 55], [4 * side, -5, 280, 69, 52], [3 * side, -4, 320, 64, 49], [0, -4, 360, 60, 47]], 0.97, 3);
+  function buildForearm(side, mats, upto = 99) {
+    const d = bi([[0, 0, -12, 37, 26], [0, 0, 16, 39, 27], [-2 * side, 1, 38, 42, 29], [-3 * side, 1, 63, 44, 32], [-4 * side, 2, 94, 49, 37], [-5 * side, 1, 128, 55, 43], [-4 * side, 0, 163, 61, 50], [0, -3, 200, 65, 55], [3 * side, -5, 240, 69, 55], [4 * side, -5, 280, 69, 52], [3 * side, -4, 320, 64, 49], [0, -4, 360, 60, 47]].slice(0, upto), 0.97, 3);
     const col = [], tone = new Jt(P_), pos = d.attributes.position;
     for (let k = 0; k < pos.count; k++) {
       const W = TAU * (k % ($i + 1)) / $i, z = pos.getZ(k);
@@ -4377,42 +4859,69 @@ var KarambitVM = (() => {
     d.setAttribute("color", new $t(col, 3));
     const m = new Mesh3(d, mats.skin); m.scale.set(0.77, 0.84, 1); return m;
   }
-  function seg(parent, z, build) { const j = new Obj3D(); j.position.z = z; parent.add(j); const c = Zr(); build(c); j.add(c.finish()); return j; }
-  function buildFinger(side, def, mats, root) {
-    const { hide, textile, trim, fingertip } = mats, [L0, L1, L2] = def.len, w = def.w, h = def.h;
-    const base = new Obj3D();
+
+  /* ---------------- digits: bones, skin, glove sleeve, nail ---------------- */
+  function bone(parent, z) { const j = new Obj3D(); j.position.z = z; parent.add(j); return j; }
+  function buildFinger(side, def, root) {
+    const [L0, L1, L2] = def.len, w = def.w, h = def.h, base = new Obj3D();
     base.position.set(side * def.mcp[0] * MM, def.mcp[1] * MM, def.mcp[2] * MM);
     base.rotation.y = -side * def.splay * DEG; root.add(base);
-    const mcp = seg(base, 0, (c) => {
-      c.add(hide, ah, bi(capsule(L0 + 2, w * 1.05, h * 1.05, w * 0.99, h * 0.97), 0.86));
-      c.add(textile, Nd, bi([[0, h * 0.66, 4, w * 0.5, h * 0.3], [0, h * 0.74, -6, w * 0.74, h * 0.42], [0, h * 0.72, -L0 * 0.55, w * 0.72, h * 0.4], [0, h * 0.62, -L0 + 3, w * 0.62, h * 0.32]], 0.83));
-      $r(c, trim, [0, -0.33, -0.66, -0.95].map((f) => new Vec3(side * w * 0.86 * MM, h * 0.36 * MM, (f * L0 - 3) * MM)), !1, 0.0046);
-    });
-    const pip = seg(mcp, -L0 * MM, (c) => c.add(fingertip, 16777215, skinUV(bi(capsule(L1, w * 0.9, h * 0.88, w * 0.85, h * 0.82), 0.92), 0.06, 0.45)));
-    const dip = seg(pip, -L1 * MM, (c) => c.add(fingertip, 16777215, skinUV(bi(capsule(L2, w * 0.83, h * 0.8, w * 0.72, h * 0.66, !0), 0.92), 0.45, 1)));
+    const mcp = bone(base, 0), pip = bone(mcp, -L0 * MM), dip = bone(pip, -L1 * MM);
     return { base, mcp, pip, dip, def, caps: [[L0, (w + h) * 0.51, (w + h) * 0.49], [L1, (w + h) * 0.445, (w + h) * 0.42], [L2 + h * 0.85, (w + h) * 0.4, (w + h) * 0.2]] };
   }
-  function buildThumb(side, mats, root) {
-    const { hide, fingertip } = mats, [L0, L1, L2] = THUMB.len, w = THUMB.w, h = THUMB.h;
+  function buildThumb(side, root) {
+    const [L0, L1, L2] = THUMB.len, w = THUMB.w, h = THUMB.h;
     const base = new Obj3D();
     base.position.set(side * THUMB.cmc[0] * MM, THUMB.cmc[1] * MM, THUMB.cmc[2] * MM);
     const z = new Vec3(-side * THUMB.dir[0], -THUMB.dir[1], -THUMB.dir[2]).normalize();
     const y = new Vec3(-side * THUMB.pad[0], -THUMB.pad[1], -THUMB.pad[2]); y.addScaledVector(z, -y.dot(z)).normalize();
     base.quaternion.setFromRotationMatrix(new Mat4().makeBasis(new Vec3().crossVectors(y, z), y, z));
     root.add(base);
-    const cmc = seg(base, 0, (c) => c.add(hide, ah, bi(capsule(L0 + 3, w * 1.22, h * 1.15, w * 1.06, h * 1.04), 0.86)));
-    const mcp = seg(cmc, -L0 * MM, (c) => c.add(fingertip, 16777215, skinUV(bi(capsule(L1, w * 0.97, h * 0.95, w * 0.92, h * 0.88), 0.92), 0.06, 0.45)));
-    const ip = seg(mcp, -L1 * MM, (c) => c.add(fingertip, 16777215, skinUV(bi(capsule(L2, w * 0.9, h * 0.84, w * 0.76, h * 0.68, !0), 0.92), 0.45, 1)));
+    const cmc = bone(base, 0), mcp = bone(cmc, -L0 * MM), ip = bone(mcp, -L1 * MM);
     return { base, cmc, mcp, ip, caps: [[L0, (w + h) * 0.56, (w + h) * 0.52], [L1, (w + h) * 0.47, (w + h) * 0.45], [L2 + h * 0.8, (w + h) * 0.43, (w + h) * 0.22]] };
+  }
+  function makeDigit(side, S, col, bones, mats, root) {
+    const sk = ringList(S.s0, S.sC, 2.4, 1.2, [[S.J[1], S.B[1] + 2.5], [S.J[2], S.B[2] + 2.5]]);
+    for (const t of [0.18, 0.34, 0.5, 0.63, 0.75, 0.85, 0.92, 0.97, 1]) sk.push(S.sC + t * (S.sEnd - S.sC));
+    const skin = new RingTube(S, sk, SKIN_SEG, side, S.skin, (s, th) => [(col + th / TAU) / 5, 1 - (s - S.s0) / (S.sEnd - S.s0)], { tip: !0 });
+    const foldAt = S.thumb ? S.J[1] + 1 : 1.5, gl = ringList(S.thumb ? -4 : -14, S.sHem, 2.4, 1, [[foldAt, 8], [S.sHem - 1.5, 1.6]]);
+    gl.push(S.sHem + 0.15);
+    const glove = new RingTube(S, gl, GLOVE_SEG, side, S.glove, (s, th) => [th / TAU, 1 - (S.sHem - s) / 48],
+      { closeLast: !0, fold: { at: foldAt, width: S.thumb ? 4.5 : 5.5, wave: 3.4 } });
+    const ms = new Mesh3(skin.geo, mats.fingerSkin), mg = new Mesh3(glove.geo, mats.gloveFinger);
+    for (const m of [ms, mg]) { m.frustumCulled = !1; root.add(m); }
+    bones[3].add(buildNail(S, side, mats.nail));
+    return { S, bones, skin, glove, meshes: [ms, mg], BP: [0, 1, 2, 3].map(() => new Vec3()), BQ: [0, 1, 2, 3].map(() => new Quat()), amp: { d: [0, 0, 0], p: [0, 0, 0], fold: 0 } };
+  }
+  // bones → skin: called once per drawn frame, after the pose is final
+  function poseDigit(D, a, f) {
+    const { BP, BQ, bones, S, amp } = D;
+    BP[0].copy(bones[0].position); BQ[0].copy(bones[0].quaternion);
+    for (let k = 1; k < 4; k++) { BQ[k].copy(BQ[k - 1]).multiply(bones[k].quaternion); BP[k].copy(bones[k].position).applyQuaternion(BQ[k - 1]).add(BP[k - 1]); }
+    const fl = S.thumb ? [0, a[19], a[20]] : [a[f * 4 + 1], a[f * 4 + 2], a[f * 4 + 3]];
+    for (let j = 0; j < 3; j++) {
+      const k = Math.sin(clamp(fl[j], 0, 110) * DEG / 2);
+      amp.d[j] = [0.14, 0.11, 0.08][j] * S.R[j][0] * k; amp.p[j] = 0.05 * S.R[j][0] * k;
+    }
+    amp.fold = 0.15 + 0.75 * sstep(S.thumb ? a[19] : a[f * 4 + 1], 12, 85);
+    D.skin.update(BP, BQ, amp); D.glove.update(BP, BQ, amp);
   }
 
   /* ---------------- hand rig ---------------- */
   function buildHand(side, mats) {
     const root = new Group3();
     const palm = buildPalm(side, mats); root.add(palm);
-    const fingers = FINGERS.map((d) => buildFinger(side, d, mats, root));
-    const thumb = buildThumb(side, mats, root);
-    return { side, root, palm, fingers, thumb, forearm: buildForearm(side, mats), cuff: buildCuff(side, mats), angles: new Float64Array(21) };
+    const fingers = FINGERS.map((d) => buildFinger(side, d, root));
+    const thumb = buildThumb(side, root);
+    const digits = [...fingers.map((F, i) => makeDigit(side, SHAPES[i], i, [F.base, F.mcp, F.pip, F.dip], mats, root)),
+      makeDigit(side, SHAPES[4], 4, [thumb.base, thumb.cmc, thumb.mcp, thumb.ip], mats, root)];
+    return { side, root, palm, fingers, thumb, digits, forearm: buildSleeve(side, mats), cuff: buildCuff(side, mats), angles: new Float64Array(21) };
+  }
+  function skinHand(hand) { // the skin lives in hand space, so it only needs work when the joint angles move
+    const a = hand.angles, last = hand.skinned || (hand.skinned = new Float64Array(21).fill(NaN));
+    let moved = !1; for (let j = 0; j < 21; j++) if (!(Math.abs(a[j] - last[j]) < 0.02)) { moved = !0; break; }
+    if (!moved) return;
+    last.set(a); for (let f = 0; f < 5; f++) poseDigit(hand.digits[f], a, f);
   }
   function applyAngles(hand, a) {
     const s = hand.side;
@@ -4467,7 +4976,8 @@ var KarambitVM = (() => {
   return function createKarambitViewmodel() {
     const scene = new ui(), cam = new Ue(59, 1, 0.02, 2.2);
     scene.environment = Hd(); scene.environmentIntensity = 0.92;
-    const mats = Bd();
+    const mats = Bd(), look = makeHandLook();
+    Object.assign(mats, { textile: look.knit, hide: look.leather, rubber: look.rubber, rib: look.rib, fingerSkin: look.skin, nail: look.nail, gloveFinger: look.gloveFinger, sleeve: look.sleeve });
     const hands = [-1, 1].map((s) => buildHand(s, mats));
     const [left, right] = hands;
     for (const h of hands) scene.add(h.root, h.forearm, h.cuff);
@@ -5365,7 +5875,9 @@ var KarambitVM = (() => {
       whoosh(dt);
     }
 
+    const inView = (h) => h.root.position.y > -0.42 && h.root.position.z < 0.1;
     function draw(renderer, camera) {
+      for (const h of hands) if (view || h === right || inView(h)) skinHand(h);
       _q1.copy(camera.quaternion).invert();
       lightFromWorld(_q1);
       scene.environmentRotation.setFromQuaternion(_q1);
@@ -5403,6 +5915,7 @@ var KarambitVM = (() => {
       freeze(v) { st.frozen = v; },
       view(v) { view = v; },
       hold(v) { held = v; },
+      setPose(which, name) { const h = which === "left" ? left : right; applyAngles(h, poseArray(POSES[name])); },
       setMove(k, sd, v) { MOVE[k][sd] = v; prepMove(); },
       setSkin, skins: () => Object.keys(SKINS), skin: () => skin, sfx: (n, k) => playSfx(n, k), SFX, audio: () => audio(),
       lights: () => ({ key, hemi, rim, fill }),
